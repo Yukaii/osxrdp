@@ -23,13 +23,11 @@ osxrdp is an unofficial module of xrdp to support rdp server in macOS.
 ## Manual
 <h6><a href="Manual.md">Link</a></h6>
 
-## Limitation
-* osxrdp is still in beta version. It may contain numerous bugs and is not suitable for production use.
-
 ## Supported OS
 macOS 12.4 or higher version.\
 Support Apple Silicon & Intel mac.
 
 ## Etc
-osxrdp is compatible with original xrdp v0.10.6.1 version. (no modificated)
+osxrdp is based on xrdp v0.10.6.1. \
+To improve H.264 video quality on macOS, I made a few adjustments to the encoder settings. The corresponding changes can be found in scripts/xrdp_patch.patch.
 
