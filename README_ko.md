@@ -21,12 +21,10 @@ osxrdp 는 macOS에서 rdp 서버를 사용할 수 있게 해주는 xrdp의 비�
 ## 사용법
 <h6><a href="Manual_ko.md">링크</h6>
 
-## 제한 사항
-* osxrdp 는 아직 베타 버전 상태입니다. 오동작할 수 있으며, 상업적 용도로 사용하기 부적절합니다.
-
 ## 지원 OS
 macOS 12.4 이상\
 Apple Silicon 및 Intel 맥을 지원합니다.
 
 ## 기타
-osxrdp 는 순정 버전의 xrdp v0.10.6.1 버전과 호환됩니다. (xrdp 에 대한 어떠한 코드 수정없이 작동합니다.)
+osxrdp 는 xrdp v0.10.6.1 버전을 사용합니다. \
+(macOS 에서 좋은 H.264 품질을 위해 약간의 인코더 옵션 조정이 있었습니다. 수정사항은 scripts/xrdp_patch.patch 에 있습니다.)
