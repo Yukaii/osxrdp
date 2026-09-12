@@ -1,0 +1,23 @@
+--- a/xrdp/xrdp_encoder_openh264.c
++++ b/xrdp/xrdp_encoder_openh264.c
+@@ -192,6 +192,9 @@
+                 encParamExt.iPicHeight = (height + 15) & ~15;
+                 encParamExt.iRCMode = RC_BITRATE_MODE;
+                 encParamExt.iSpatialLayerNum = 1;
++                encParamExt.iMinQp = 12;
++                encParamExt.iMaxQp = 36;
++
+                 /* Set encode parameters from config */
+                 encParamExt.bEnableFrameSkip = og->openh264_param[ct].EnableFrameSkip;
+                 encParamExt.iTargetBitrate = og->openh264_param[ct].TargetBitrate;
+@@ -205,8 +208,10 @@
+                 slc->iVideoHeight = encParamExt.iPicHeight;
+                 slc->iSpatialBitrate = encParamExt.iTargetBitrate;
+                 slc->iMaxSpatialBitrate = encParamExt.iMaxBitrate;
++
+                 slc->bVideoSignalTypePresent = 1;
+                 slc->bFullRange = 1;
++
+                 status = ENC_INITIALIZE_EXT(
+                              oe->openh264_enc_han, &encParamExt);
+                 LOG(LOG_LEVEL_INFO, "xrdp_encoder_openh264_encode: "
