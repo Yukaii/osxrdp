@@ -79,7 +79,7 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
         _recordConfig.preservesAspectRatio = NO;
     }
     
-    _recordConfig.minimumFrameInterval = CMTimeMake(1, framerate);
+    _recordConfig.minimumFrameInterval = CMTimeMake(100, framerate * 105);
     
     // 녹화 큐 설정
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);

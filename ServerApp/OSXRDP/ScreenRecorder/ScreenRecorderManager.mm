@@ -338,7 +338,10 @@ bool ScreenRecorderManager::CreateRecordShm(int recordIdx) {
     const int height = GetMonitorRecordHeight(recordIdx);
 
     // todo : format 마다 정확한 크기 설정하기
-    int rawDataSize = width * height * 5 + (sizeof(size_t) * 2);
+    // slot 은 osxup 이 mmap하여 xrdp 에 넘길 수 있도록 offset 과 stride 를 page 정렬한다.
+    const int dataOffset = (int)((sizeof(screenrecord_shm_t) + OSXRDP_SHM_ALIGN - 1) & ~(size_t)(OSXRDP_SHM_ALIGN - 1));
+    const int rawDataSize = (int)((OSXRDP_SLOT_DATA_OFFSET + (size_t)width * height * 5 + OSXRDP_SHM_ALIGN - 1) & ~(size_t)(OSXRDP_SHM_ALIGN - 1));
+    const size_t totalSize = (size_t)dataOffset + (size_t)rawDataSize * FRAME_SLOTS;
     
     char shm_name[512];
     if (get_object_name_by_sessionid("/osxrdpshm", shm_name, 512, is_root_process()) == 0) {
@@ -348,20 +351,21 @@ bool ScreenRecorderManager::CreateRecordShm(int recordIdx) {
     char shm_name_with_idx[512];
     snprintf(shm_name_with_idx, sizeof(shm_name_with_idx), "%s_%d", shm_name, outputIndex);
 
-    _recordShm[outputIndex] = xshm_create(shm_name_with_idx, sizeof(screenrecord_shm_t) + (rawDataSize * FRAME_SLOTS));
+    _recordShm[outputIndex] = xshm_create(shm_name_with_idx, (int)totalSize);
     if (_recordShm[outputIndex] == NULL) {
         NSLog(@"[ScreenRecorderManager::CreateRecordShm] xshm_create failed. outputIndex = %d", outputIndex);
         
         return false;
     }
     
-    memset(_recordShm[outputIndex]->mem, 0x00, sizeof(screenrecord_shm_t) + (rawDataSize * FRAME_SLOTS));
+    memset(_recordShm[outputIndex]->mem, 0x00, totalSize);
     
     screenrecord_shm_t* shm = (screenrecord_shm_t*)_recordShm[outputIndex]->mem;
     shm->width = width;
     shm->height = height;
     shm->fps = 60;
     shm->screenrecord_data_size = rawDataSize;
+    shm->screenrecord_data_offset = dataOffset;
     
     _recordShmCnt++;
     
@@ -545,7 +549,8 @@ bool ScreenRecorderManager::AcquireFrameSlot(screenrecord_shm_t** recordInfoOut,
     int index = writePos % FRAME_SLOTS;
     *recordInfoOut = recordInfo;
     *frameOut = &recordInfo->frames[index];
-    *dataOut = recordInfo->screenrecord_datas + (recordInfo->screenrecord_data_size * index);
+    *dataOut = (char*)recordInfo + recordInfo->screenrecord_data_offset
+             + (size_t)recordInfo->screenrecord_data_size * index;
     *writePosOut = writePos;
 
     return true;
@@ -601,7 +606,7 @@ bool ScreenRecorderManager::CopyNV12PackedFrame(void* imageBufferRef, char* scre
     size_t packedImgSize = (width * height) + (width * uvHeight);
 
     memcpy(screenrecord_data, &packedImgSize, sizeof(size_t));
-    uint8_t* dstData = (uint8_t*)(screenrecord_data + sizeof(size_t));
+    uint8_t* dstData = (uint8_t*)(screenrecord_data + OSXRDP_SLOT_DATA_OFFSET);
     CopyRows(dstData, ySrcBase, rowBytes, yStride, height);
 
     uint8_t* dstUV = dstData + (width * height);
@@ -639,9 +644,9 @@ bool ScreenRecorderManager::CopyNV12AlignedFrame(void* imageBufferRef, char* scr
     memcpy(screenrecord_data, &alignedImgSize, sizeof(size_t));
     
     // hack (to pass stride value to xrdp vtoolbox encorder)
-    memcpy((uint8_t*)screenrecord_data + sizeof(size_t), &yStride, sizeof(size_t));
+    memcpy((uint8_t*)screenrecord_data + OSXRDP_SLOT_DATA_OFFSET, &yStride, sizeof(size_t));
     
-    uint8_t* dstData = (uint8_t*)(screenrecord_data + (sizeof(size_t) * 2));
+    uint8_t* dstData = (uint8_t*)(screenrecord_data + OSXRDP_SLOT_DATA_OFFSET + sizeof(size_t));
     memcpy(dstData, ySrcBase, yStride * height);
     
     uint8_t* dstUV = dstData + (yStride * height);
@@ -675,7 +680,7 @@ bool ScreenRecorderManager::CopyBGRA32Frame(void* imageBufferRef, char* screenre
     size_t imgSize = rowSize * height;
 
     memcpy(screenrecord_data, &imgSize, sizeof(size_t));
-    uint8_t* dest = (uint8_t*)screenrecord_data + sizeof(size_t);
+    uint8_t* dest = (uint8_t*)screenrecord_data + OSXRDP_SLOT_DATA_OFFSET;
     CopyRows(dest, rawImageBuffer, rowSize, bytesPerRow, height);
 
     *widthOut = (int)width;
@@ -1077,9 +1082,9 @@ bool ScreenRecorderManager::HandleRFXDirtyArea(void* pixelBuffer, screenrecord_f
         return false;
     }
 
-    // layout: [size_t imgSize][int tileCount][int indices[tileCount]][uint8 tileData[tileCount*16384]]
-    int* slotCountPtr = (int*)(screenrecord_data + sizeof(size_t));
-    int* slotIndices  = (int*)(screenrecord_data + sizeof(size_t) + sizeof(int));
+    // layout: [size_t imgSize][pad .. OSXRDP_SLOT_DATA_OFFSET][int tileCount][int indices[tileCount]][uint8 tileData[tileCount*16384]]
+    int* slotCountPtr = (int*)(screenrecord_data + OSXRDP_SLOT_DATA_OFFSET);
+    int* slotIndices  = (int*)(screenrecord_data + OSXRDP_SLOT_DATA_OFFSET + sizeof(int));
 
     int slotTileCount = 0;
     for (size_t ty = 0; ty < tileRows; ++ty) {
