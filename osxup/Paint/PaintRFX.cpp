@@ -206,7 +206,17 @@ void PaintRFX::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, c
     const int* slotIndices = (const int*)(slot + sizeof(int));
     const unsigned char* slotTileData = (const unsigned char*)(slotIndices + slotTileCount);
 
+    XRDP_EGFX_START_FRAME startCmd;
+    startCmd.header.cmdId = 11;
+    startCmd.header.flags = 0;
+    startCmd.header.pduLength = sizeof(startCmd);
+    startCmd.timestamp = 0;
+    startCmd.frame_id = frame_id;
+
     xstream_resetPos(_drawCmd);
+    xstream_writeData(_drawCmd, &startCmd, sizeof(startCmd));
+
+    char* wire_start_ptr = (char*)_drawCmd->data_current;
 
     // header
     xstream_writeInt16(_drawCmd, XR_RDPGFX_CMDID_WIRETOSURFACE_2);  // cmdId
@@ -249,8 +259,17 @@ void PaintRFX::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, c
     xstream_writeInt16(_drawCmd, _width);
     xstream_writeInt16(_drawCmd, _height);
 
-    int dataLen = (int)((char*)_drawCmd->data_current - (char*)_drawCmd->data_start);
-    *(int*)((char*)_drawCmd->data_start + sizeof(int)) = dataLen;
+    int dataLen = (int)((char*)_drawCmd->data_current - wire_start_ptr);
+
+    *(int*)(wire_start_ptr + sizeof(int)) = dataLen;
+
+    XRDP_EGFX_END_FRAME endCmd;
+    endCmd.header.cmdId = 12;
+    endCmd.header.flags = 0;
+    endCmd.header.pduLength = sizeof(endCmd);
+    endCmd.frame_id = frame_id;
+
+    xstream_writeData(_drawCmd, &endCmd, sizeof(endCmd));
 
     void* mapped = mmap(NULL, _tileDataSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (mapped == MAP_FAILED) {
@@ -267,21 +286,6 @@ void PaintRFX::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, c
                tileSize);
     }
 
-    XRDP_EGFX_START_FRAME startCmd;
-    startCmd.header.cmdId = 11;
-    startCmd.header.flags = 0;
-    startCmd.header.pduLength = sizeof(startCmd);
-    startCmd.timestamp = 0;
-    startCmd.frame_id = frame_id;
-
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&startCmd, sizeof(startCmd), NULL, 0);
+    dataLen = (int)((char*)_drawCmd->data_current - (char*)_drawCmd->data_start);
     mod->server_egfx_cmd((struct mod*)mod, (char*)_drawCmd->data_start, dataLen, (char*)mapped, (int)_tileDataSize);
-
-    XRDP_EGFX_END_FRAME endCmd;
-    endCmd.header.cmdId = 12;
-    endCmd.header.flags = 0;
-    endCmd.header.pduLength = sizeof(endCmd);
-    endCmd.frame_id = frame_id;
-
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&endCmd, sizeof(endCmd), NULL, 0);
 }

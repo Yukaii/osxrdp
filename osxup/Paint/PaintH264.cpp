@@ -118,9 +118,10 @@ void PaintH264::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, 
     startCmd.timestamp = 0;
     startCmd.frame_id = frame_id;
     
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&startCmd, sizeof(startCmd), NULL, 0);
-    
     xstream_resetPos(_drawCmd);
+    xstream_writeData(_drawCmd, &startCmd, sizeof(startCmd));
+
+    char* wire_start_ptr = (char*)_drawCmd->data_current;
     
     // header
     xstream_writeInt16(_drawCmd, 0x1);       // cmdId
@@ -162,11 +163,9 @@ void PaintH264::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, 
     xstream_writeInt16(_drawCmd, width);
     xstream_writeInt16(_drawCmd, height);
     
-    int dataLen = (int)((char*)_drawCmd->data_current - (char*)_drawCmd->data_start);
+    int dataLen = (int)((char*)_drawCmd->data_current - wire_start_ptr);
     
-    *(int*)((char*)_drawCmd->data_start + sizeof(int)) = dataLen;
-
-    mod->server_egfx_cmd((struct mod*)mod, (char*)_drawCmd->data_start, dataLen, imgData, (int)imgDataSize);
+    *(int*)(wire_start_ptr + sizeof(int)) = dataLen;
 
     XRDP_EGFX_END_FRAME endCmd;
     endCmd.header.cmdId = 12;
@@ -174,5 +173,8 @@ void PaintH264::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, 
     endCmd.header.pduLength = sizeof(endCmd);
     endCmd.frame_id = frame_id;
     
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&endCmd, sizeof(endCmd), NULL, 0);
+    xstream_writeData(_drawCmd, &endCmd, sizeof(endCmd));
+
+    dataLen = (int)((char*)_drawCmd->data_current - (char*)_drawCmd->data_start);
+    mod->server_egfx_cmd((struct mod*)mod, (char*)_drawCmd->data_start, dataLen, imgData, (int)imgDataSize);
 }

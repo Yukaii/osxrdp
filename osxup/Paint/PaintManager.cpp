@@ -161,6 +161,8 @@ bool PaintManager::TryReleaseForReconnect() {
 
 void PaintManager::ReleaseResources() {
     if (_paint != NULL) {
+        _paint->Release();
+        
         delete _paint;
         _paint = NULL;
     }
