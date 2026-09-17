@@ -7,6 +7,7 @@
 #include "PaintRFX.h"
 #include "utils.h"
 #include <limits.h>
+#include <sys/mman.h>
 
 static const char* OSXRDP_SCREENSHM_NAME = "/osxrdpshm";
 static const char* OSXRDP_CURSORSHM_NAME = "/osxrdpcursorshm";
@@ -160,6 +161,8 @@ bool PaintManager::TryReleaseForReconnect() {
 
 void PaintManager::ReleaseResources() {
     if (_paint != NULL) {
+        _paint->Release();
+        
         delete _paint;
         _paint = NULL;
     }
@@ -230,14 +233,34 @@ void PaintManager::Paint() {
                 break;
             }
 
+            char* payload = imgData;
+            size_t payloadBytes = imgDataSize;
+
+            // xrdp 가 이미지 데이터를 비동기로 읽고 직접 munmap 하는 포맷 (h.264)을 위해 새 메모리를 넘긴다.
+            if (_paint->NeedsOwnedPayload() == true) {
+                screenrecord_shm_t* shm = (screenrecord_shm_t*)_recordShm[i]->mem;
+                size_t mapOffset = (size_t)shm->screenrecord_data_offset
+                                 + (size_t)shm->screenrecord_data_size * (shm_frame_id % FRAME_SLOTS)
+                                 + OSXRDP_SLOT_DATA_OFFSET;
+
+                payloadBytes = (size_t)shm->screenrecord_data_size - OSXRDP_SLOT_DATA_OFFSET;
+                payload = (char*)mmap(NULL, payloadBytes, PROT_READ, MAP_SHARED, _recordShm[i]->fd, (off_t)mapOffset);
+                if (payload == MAP_FAILED) {
+                    break;
+                }
+            }
+
             unsigned int frame_id = 0;
             if (PushInFlight(i, shm_frame_id, &frame_id) == false) {
+                if (payload != imgData) {
+                    munmap(payload, payloadBytes);
+                }
                 break;
             }
             _inPainting = (_inFlightCount > 0);
 
             // 그리기
-            _paint->DoPaint(_mod, frameInfo, imgData, imgDataSize, frame_id, i, width, height);
+            _paint->DoPaint(_mod, frameInfo, payload, payloadBytes, frame_id, i, width, height);
             
             cnt++;
         }
@@ -285,13 +308,17 @@ bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outI
     
     unsigned int idx = targetPos % FRAME_SLOTS;
     screenrecord_frame_t* frame = &(shm->frames[idx]);
-    char* imgData = shm->screenrecord_datas + (size_t)shm->screenrecord_data_size * idx;
+    char* imgData = (char*)shm + shm->screenrecord_data_offset
+                  + (size_t)shm->screenrecord_data_size * idx;
 
     size_t imgDataSize = 0;
     memcpy(&imgDataSize, imgData, sizeof(size_t));
 
     // abnormal data --> skip it
-    if (imgDataSize == 0 || imgDataSize > shm->screenrecord_data_size)
+    if (imgDataSize == 0 || imgDataSize > (size_t)shm->screenrecord_data_size - OSXRDP_SLOT_DATA_OFFSET)
+        return false;
+
+    if (shm->width <= 0 || shm->height <= 0)
         return false;
 
     if (forceRedrawAll != 0) {
@@ -299,7 +326,7 @@ bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outI
     }
 
     *outFrameInfo = frame;
-    *outImgData = imgData + sizeof(size_t);
+    *outImgData = imgData + OSXRDP_SLOT_DATA_OFFSET;
     *outImgDataSize = imgDataSize;
     *outWidth = shm->width;
     *outHeight = shm->height;

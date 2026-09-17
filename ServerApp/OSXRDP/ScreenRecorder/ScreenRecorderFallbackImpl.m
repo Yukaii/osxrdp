@@ -42,7 +42,7 @@
     
     CGColorSpaceRef sRGB = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     
-    float frameTime = 1.0f / framerate;
+    float frameTime = 100.0f / (framerate * 105);
 
     _recordConfig = @{
         (__bridge NSString*)kCGDisplayStreamShowCursor : @NO,

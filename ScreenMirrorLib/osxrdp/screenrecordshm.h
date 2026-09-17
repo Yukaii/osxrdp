@@ -7,8 +7,12 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include "xshm.h"
 
-#define FRAME_SLOTS             7
-#define MAX_DIRTY_COUNT         128
+#define FRAME_SLOTS             (7)
+#define MAX_DIRTY_COUNT         (128)
+
+// slot 은 xrdp 에 바로 넘길 수 있도록 page 정렬되어야 한다. (16K, 4K)
+#define OSXRDP_SHM_ALIGN        (16384)
+#define OSXRDP_SLOT_DATA_OFFSET (16384)
 
 struct RECT {
     short x;
@@ -45,7 +49,7 @@ typedef struct screenrecord_shm {
     _Atomic int consumer_request_full;
     screenrecord_frame_t frames[FRAME_SLOTS];
     int screenrecord_data_size;
-    char screenrecord_datas[1];
+    int screenrecord_data_offset;
 } screenrecord_shm_t;
 
 // ---------------------------------------------------------------------------
@@ -55,7 +59,8 @@ typedef struct screenrecord_shm {
 //                            = sizeof(int)                              // tileCount
 //                            + sizeof(int) * tileCount                  // indices
 //                            + 16384 * tileCount                        // tile payload
-//   offset sizeof(size_t): int tileCount                                // 이 slot 에 포함된 tile 개수
+//   offset OSXRDP_SLOT_DATA_OFFSET
+//                        : int tileCount                                // 이 slot 에 포함된 tile 개수
 //   이어서               : int indices[tileCount]                       // row-major 전역 tile 인덱스
 //   이어서               : uint8_t tileData[tileCount * 16384]          // YUV444 planar (Y, U, V, A)
 //

@@ -19,6 +19,11 @@ public:
     //   - BGRA32 / NV12 : slot = 전체 frame 이미지       → true  (기본값)
     //   - RFX           : slot = "이번에 변경된 타일"만   → false
     virtual bool FrameIsSelfContained() const { return true; }
+
+    // shm (이미지 데이터) 소유권이 xrdp로 넘어가는지 여부
+    //   - true  : PaintManager 가 slot 을 mmap 하고 소유권을 xrdp로 넘긴다 (xrdp가 mumap)
+    //   - false : xrdp 가 shm을 읽기만 함
+    virtual bool NeedsOwnedPayload() const { return false; }
 };
 
 #endif
