@@ -56,6 +56,10 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
         return false;
     }
 
+    if (_recordParams.recordFormat == OSXRDP_RECORDFORMAT_RFX && InitRFXConversion() == false) {
+        return false;
+    }
+
     if (ResolveDisplayForRecorder() == false) {
         return false;
     }
@@ -674,6 +678,41 @@ bool ScreenRecorderManager::CopyBGRA32Frame(void* imageBufferRef, char* screenre
     return true;
 }
 
+bool ScreenRecorderManager::CopyRFXFrame(void* imageBufferRef, char* screenrecord_data, int* widthOut, int* heightOut) {
+    if (imageBufferRef == NULL || screenrecord_data == NULL || widthOut == NULL || heightOut == NULL) {
+        return false;
+    }
+
+    CVPixelBufferRef imageBuffer = (CVPixelBufferRef)imageBufferRef;
+    size_t width = CVPixelBufferGetWidth(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    if (width == 0 || height == 0) {
+        return false;
+    }
+
+    uint8_t* rawImageBuffer = (uint8_t*)CVPixelBufferGetBaseAddress(imageBuffer);
+    if (rawImageBuffer == NULL) {
+        return false;
+    }
+    
+    size_t srcStride = CVPixelBufferGetBytesPerRow(imageBuffer);
+
+    // BGRA32 데이터를 SHM 의 packed Cr/Y/Cb (픽셀당 3바이트) 로 변환
+    const uint8_t permute[4] = { 3, 2, 1, 0 };
+    vImage_Buffer src = { rawImageBuffer, height, width, srcStride };
+    vImage_Buffer dst = { screenrecord_data + OSXRDP_SLOT_DATA_OFFSET, height, width, width * 3 };
+    
+    if (vImageConvert_ARGB8888To444CrYpCb8(&src, &dst, &_rfxConversionInfo, permute, kvImageNoFlags) != kvImageNoError) {
+        return false;
+    }
+
+    size_t imgSize = width * height * 3;
+    memcpy(screenrecord_data, &imgSize, sizeof(size_t));
+    *widthOut = (int)width;
+    *heightOut = (int)height;
+    return true;
+}
+
 void ScreenRecorderManager::PopulateDirtyRectsFromSampleBuffer(void* sampleBufferRef, int width, int height, screenrecord_frame* current_frame) {
     if (current_frame == NULL) {
         return;
@@ -918,11 +957,7 @@ void ScreenRecorderManager::HandleRFXRecordData(void* pixelBuffer, const CGRect*
         return;
     }
 
-    if (HandleRFXDirtyArea(pixelBuffer, slot, dirtyRects, dirtyRectsCnt, screenrecord_data) == false) {
-        recorder->AddPendingDirtyFromPixelBuffer(displayIdx, pixelBuffer, dirtyRects, dirtyRectsCnt);
-        return;
-    }
-    
+    recorder->HandleRFXDirtyArea(pixelBuffer, slot, dirtyRects, dirtyRectsCnt, screenrecord_data);
     recorder->ApplyPendingDirty(displayIdx, slot);
     recorder->CommitFrameSlot(recordInfo, writePos, displayIdx);
     recorder->ResetPendingDirty(displayIdx);
@@ -949,9 +984,14 @@ bool ScreenRecorderManager::HandleRFXDirtyArea(void* pixelBuffer, screenrecord_f
     return true;
 }
 
-bool ScreenRecorderManager::CopyRFXFrame(void* imageBuffer, char* screenrecord_data, int* widthOut, int* heightOut) {
-    return false;
+bool ScreenRecorderManager::InitRFXConversion() {
+    const vImage_YpCbCrPixelRange range = { 0, 128, 255, 255, 255, 0, 255, 0 };
+    
+    // accelerator init
+    vImage_Error re = vImageConvert_ARGBToYpCbCr_GenerateConversion(kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4, &range, &_rfxConversionInfo, kvImageARGB8888, kvImage444CrYpCb8, kvImageNoFlags);
+    return re == kvImageNoError;
 }
+
 
 inline void ScreenRecorderManager::ProcessDirtyArea(const CGRect* rect, int limX, int limY, struct RECT* dst) {
     const int orgX = (int)rect->origin.x;

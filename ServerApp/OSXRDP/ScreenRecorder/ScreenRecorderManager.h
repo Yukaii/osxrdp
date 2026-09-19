@@ -2,6 +2,8 @@
 #ifndef ScreenRecorder_hpp
 #define ScreenRecorder_hpp
 
+#include <Accelerate/Accelerate.h>
+
 #include "ipc.h"
 #include "xstream.h"
 #include "xshm.h"
@@ -68,6 +70,8 @@ private:
     
     VirtualMonitor _virtualMonitor;
 
+    vImage_ARGBToYpCbCr _rfxConversionInfo;
+
     screenrecord_frame_t _pendingDirty[16];
     bool _pendingDirtyFull[16];
 
@@ -78,6 +82,7 @@ private:
     void DestroyCursorShm();
     
     bool StartRecord(xstream_t* cmd);
+    bool InitRFXConversion();
     
     bool ParseStartRecordParams(xstream_t* cmd, RecordStartParams* params);
     bool PrepareRecordResources();
@@ -98,7 +103,7 @@ private:
     static void HandleNV12AlignedDirtyArea(void* pixelBuffer, screenrecord_frame* current_frame, const CGRect* dirtyRects, int dirtyRectsCnt, char* screenrecord_data);
     
     static void HandleRFXRecordData(void* pixelBuffer, const CGRect* dirtyRects, int dirtyRectsCnt, void* userData, int displayIdx);
-    static bool HandleRFXDirtyArea(void* pixelBuffer, screenrecord_frame* current_frame, const CGRect* dirtyRects, int dirtyRectsCnt, char* screenrecord_data);
+    bool HandleRFXDirtyArea(void* pixelBuffer, screenrecord_frame* current_frame, const CGRect* dirtyRects, int dirtyRectsCnt, char* screenrecord_data);
     
     // 데이터를 작성할 slot 찾기
     bool AcquireFrameSlot(screenrecord_shm_t** recordInfoOut, screenrecord_frame** frameOut, char** dataOut, unsigned int* writePosOut, int displayIdx);
@@ -119,7 +124,7 @@ private:
     static bool CopyBGRA32Frame(void* imageBuffer, char* screenrecord_data, int* widthOut, int* heightOut);
 
     // YUV444 데이터를 메모리에 기록
-    static bool CopyRFXFrame(void* imageBuffer, char* screenrecord_data, int* widthOut, int* heightOut);
+    bool CopyRFXFrame(void* imageBuffer, char* screenrecord_data, int* widthOut, int* heightOut);
     
     // dirty area (변화한 구역) 정보 처리
     inline static void ProcessDirtyArea(const CGRect* rect, int limitX, int limitY, struct RECT* dst);
