@@ -288,24 +288,12 @@ bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outI
     bool selfContained = (_paint == NULL || _paint->FrameIsSelfContained() == true);
     bool trueBacklog = (displayInFlightCount == 0 && (write_pos - read_pos >= FRAME_SLOTS));
     
-    // backlog 를 처리하는 방법
-    //   - self-contained 포맷 (BGRA32 / NV12) : 최신 slot 으로 점프해서 full 로 처리.
-    //   - partial-frame 포맷 (RFX)            : 중간 dirty tile 을 재구성할 수 없으므로 backlog 전체를 drop 하고 producer 에게 full redraw 를 요청. 이번 paint 는 무시.
-    if (selfContained == false) {
-        if (trueBacklog == true) {
-            _nextSubmitPos[displayIdx] = write_pos;
-            atomic_store_explicit(&shm->consumer_request_full, 1, memory_order_release);
-            atomic_store_explicit(&shm->read_pos, write_pos, memory_order_release);
-            return false;
-        }
+    // 독립된 프레임만 최신 frame으로 점프 가능
+    if (selfContained && (trueBacklog || (displayInFlightCount == 0 && read_pos == 0))) {
+        targetPos = write_pos - 1;
+        forceRedrawAll = 1;
     }
-    else {
-        if (trueBacklog == true || (displayInFlightCount == 0 && read_pos == 0)) {
-            targetPos = write_pos - 1;
-            forceRedrawAll = 1;
-        }
-    }
-    
+
     unsigned int idx = targetPos % FRAME_SLOTS;
     screenrecord_frame_t* frame = &(shm->frames[idx]);
     char* imgData = (char*)shm + shm->screenrecord_data_offset

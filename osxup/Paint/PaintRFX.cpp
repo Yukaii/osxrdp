@@ -3,6 +3,8 @@
 #include "../osxup.h"
 #include <sys/mman.h>
 
+static const size_t RFX_TILE_BYTES = 64 * 64 * 4;
+
 static const short XR_RDPGFX_CMDID_WIRETOSURFACE_2 = 0x0002;
 static const short XR_RDPGFX_CODECID_CAPROGRESSIVE = 0x0009;
 static const char XR_PIXEL_FORMAT_XRGB_8888 = 0x20;
@@ -198,7 +200,7 @@ void PaintRFX::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, c
     }
 
     // slot 크기 검증: header(int) + indices(int*n) + tileData(16384*n)
-    const size_t expected = sizeof(int) + sizeof(int) * (size_t)slotTileCount + (size_t)slotTileCount * OSXRDP_RFX_TILE_BYTES;
+    const size_t expected = sizeof(int) + sizeof(int) * (size_t)slotTileCount + (size_t)slotTileCount * RFX_TILE_BYTES;
     if (imgDataSize < expected) {
         return;
     }
