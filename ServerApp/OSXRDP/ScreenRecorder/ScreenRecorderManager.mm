@@ -393,12 +393,8 @@ bool ScreenRecorderManager::CreateCursorShm() {
         
         return false;
     }
-    
+
     memset(_cursorShm->mem, 0x00, sizeof(cursor_data_t));
-    
-    // init cursor mask
-    cursor_data_t* cursor_data = (cursor_data_t*)_cursorShm->mem;
-    memset(cursor_data->cursorMaskData, 0xFF, MAX_CURSOR_IMG_BUFFER_SIZE);
     
     return true;
 }
