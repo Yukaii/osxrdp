@@ -221,7 +221,7 @@ void PaintManager::Paint() {
         // in-flight 여유가 있는 동안 최대 3회 paint
         int cnt = 0;
         while (_inFlightCountByDisplay[i] < FRAME_SLOTS && cnt < 3) {
-            screenrecord_frame_t* frameInfo = NULL;
+            screenrecord_frame_t frameInfo;
             char* imgData = NULL;
             size_t imgDataSize = 0;
             int width = 0;
@@ -257,17 +257,18 @@ void PaintManager::Paint() {
                 }
                 break;
             }
+            
             _inPainting = (_inFlightCount > 0);
 
             // 그리기
-            _paint->DoPaint(_mod, frameInfo, payload, payloadBytes, frame_id, i, width, height);
+            _paint->DoPaint(_mod, &frameInfo, payload, payloadBytes, frame_id, i, width, height);
             
             cnt++;
         }
     }
 }
 
-bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outImgData, size_t* outImgDataSize, int* outWidth, int* outHeight, unsigned int* frame_id, int displayIdx) {
+bool PaintManager::GetPaintData(screenrecord_frame_t* outFrameInfo, char** outImgData, size_t* outImgDataSize, int* outWidth, int* outHeight, unsigned int* frame_id, int displayIdx) {
     screenrecord_shm_t* shm = (screenrecord_shm_t*)_recordShm[displayIdx]->mem;
 
     // 읽을 데이터가 있는지 확인
@@ -285,11 +286,15 @@ bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outI
         return false;
     }
 
-    bool selfContained = (_paint == NULL || _paint->FrameIsSelfContained() == true);
-    bool trueBacklog = (displayInFlightCount == 0 && (write_pos - read_pos >= FRAME_SLOTS));
-    
-    // 독립된 프레임만 최신 frame으로 점프 가능
-    if (selfContained && (trueBacklog || (displayInFlightCount == 0 && read_pos == 0))) {
+    const bool trueBacklog = (displayInFlightCount == 0 && (write_pos - read_pos >= FRAME_SLOTS));
+    const unsigned int beginPos = targetPos;
+    const bool mergePending = _paint->CanMergePendingFrames();
+    if (mergePending) {
+        // 최신 프레임과 이미 온 프레임들의 dirty 정보를 merge할 수 있도록
+        targetPos = write_pos - 1;
+    }
+    else if (trueBacklog || (displayInFlightCount == 0 && read_pos == 0)) {
+        // 최신 프레임으로 jump
         targetPos = write_pos - 1;
         forceRedrawAll = 1;
     }
@@ -309,11 +314,15 @@ bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outI
     if (shm->width <= 0 || shm->height <= 0)
         return false;
 
-    if (forceRedrawAll != 0) {
-        frame->dirtyCount = 0;
+    if (mergePending) {
+        MergeDirtyFrames(shm, beginPos, targetPos + 1, outFrameInfo);
     }
-
-    *outFrameInfo = frame;
+    else {
+        *outFrameInfo = *frame;
+        if (forceRedrawAll != 0)
+            outFrameInfo->dirtyCount = 0; // 강제 full redraw
+    }
+    
     *outImgData = imgData + OSXRDP_SLOT_DATA_OFFSET;
     *outImgDataSize = imgDataSize;
     *outWidth = shm->width;
@@ -322,6 +331,54 @@ bool PaintManager::GetPaintData(screenrecord_frame_t** outFrameInfo, char** outI
     *frame_id = targetPos;
 
     return true;
+}
+
+void PaintManager::MergeDirtyFrames(const screenrecord_shm_t* shm, unsigned int begin, unsigned int end, screenrecord_frame_t* frame) {
+    frame->dirtyCount = 0;
+    
+    for (unsigned int pos = begin; pos < end; pos++) {
+        const screenrecord_frame_t* src = &shm->frames[pos % FRAME_SLOTS];
+        
+        // 한도 초과. full refresh
+        if (src->dirtyCount <= 0 || src->dirtyCount > MAX_DIRTY_COUNT) {
+            frame->dirtyCount = 0;
+            return;
+        }
+
+        for (int i = 0; i < src->dirtyCount; i++) {
+            const RECT* rect = &src->dirtys[i];
+            bool contained = false;
+            for (int j = 0; j < frame->dirtyCount; ) {
+                RECT* current = &frame->dirtys[j];
+                if (rect->x >= current->x && rect->y >= current->y &&
+                    rect->x + rect->width <= current->x + current->width &&
+                    rect->y + rect->height <= current->y + current->height) {
+                    contained = true;
+                    break;
+                }
+                
+                if (current->x >= rect->x && current->y >= rect->y &&
+                    current->x + current->width <= rect->x + rect->width &&
+                    current->y + current->height <= rect->y + rect->height) {
+                    // 새 영역에 포함되는 기존 항목은 마지막 항목으로 대체
+                    *current = frame->dirtys[--frame->dirtyCount];
+                    continue;
+                }
+                
+                j++;
+            }
+            
+            if (contained)
+                continue;
+            
+            if (frame->dirtyCount >= MAX_DIRTY_COUNT) {
+                frame->dirtyCount = 0;
+                return;
+            }
+            
+            frame->dirtys[frame->dirtyCount++] = *rect;
+        }
+    }
 }
 
 bool PaintManager::PushInFlight(int displayIdx, unsigned int shmReadPos, unsigned int* outFrameId) {

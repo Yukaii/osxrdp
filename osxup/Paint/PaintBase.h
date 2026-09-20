@@ -15,10 +15,10 @@ public:
     virtual void Release() = 0;
     virtual void DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, char* imgData, size_t imgDataSize, int frame_id, int displayId, int width, int height) = 0;
 
-    // shm의 슬롯에 담긴 프레임이 전체 frame 인지 / 일부 변경점만 포함하는지의 여부
-    //   - BGRA32 / NV12 : slot = 전체 frame 이미지       → true  (기본값)
-    //   - RFX           : slot = "이번에 변경된 타일"만   → false
-    virtual bool FrameIsSelfContained() const { return true; }
+    // 최신 슬롯으로 건너뛸 때 미제출 프레임의 dirty를 병합할 수 있는지 여부.
+    //   - true  : 항상 최신 슬롯을 쓰고 건너뛴 프레임의 dirty를 병합 (RFX)
+    //   - false : backlog 일 때만 최신 슬롯으로 점프하고 full redraw(BGRA32 / NV12)
+    virtual bool CanMergePendingFrames() const { return false; }
 
     // shm (이미지 데이터) 소유권이 xrdp로 넘어가는지 여부
     //   - true  : PaintManager 가 slot 을 mmap 하고 소유권을 xrdp로 넘긴다 (xrdp가 mumap)

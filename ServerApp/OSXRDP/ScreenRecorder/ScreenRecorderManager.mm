@@ -957,7 +957,11 @@ void ScreenRecorderManager::HandleRFXRecordData(void* pixelBuffer, const CGRect*
         return;
     }
 
-    recorder->HandleRFXDirtyArea(pixelBuffer, slot, dirtyRects, dirtyRectsCnt, screenrecord_data);
+    if (recorder->HandleRFXDirtyArea(pixelBuffer, slot, dirtyRects, dirtyRectsCnt, screenrecord_data) == false) {
+        recorder->AddPendingDirtyFromPixelBuffer(displayIdx, pixelBuffer, dirtyRects, dirtyRectsCnt);
+        recorder->SendNeedPaintMsg(displayIdx);
+        return;
+    }
     recorder->ApplyPendingDirty(displayIdx, slot);
     recorder->CommitFrameSlot(recordInfo, writePos, displayIdx);
     recorder->ResetPendingDirty(displayIdx);

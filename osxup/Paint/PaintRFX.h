@@ -11,8 +11,8 @@ public:
     void Release();
     void DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, char* imgData, size_t imgDataSize, int frame_id, int displayId, int width, int height);
 
-    // dirty 병합을 구현하기 전까지 프레임을 순서대로 소비한다.
-    bool FrameIsSelfContained() const { return false; }
+    // 최신 프레임을 사용할 때는 건너뛴 프레임의 dirty를 병합한다.
+    bool CanMergePendingFrames() const { return true; }
 
 private:
 

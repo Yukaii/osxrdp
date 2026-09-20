@@ -106,6 +106,8 @@ bool PaintRFX::SubmitFrame(const struct mod* mod, screenrecord_frame_t* frameInf
 
     if (display->tiles == NULL || width != display->width || height != display->height ||
         imgDataSize < (size_t)width * height * 3) {
+        // 제출에 실패한 프레임의 dirty 영역은 다시 보내지지 않으므로, 다음 프레임을 full redraw 로 돌려 복구한다.
+        display->frameSubmitted = false;
         return false;
     }
 
@@ -113,18 +115,22 @@ bool PaintRFX::SubmitFrame(const struct mod* mod, screenrecord_frame_t* frameInf
     const int tileCount = SelectTiles(display, frameInfo, &dirtyFrame);
 
     char* data = (char*)mmap(NULL, display->dataSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (data == MAP_FAILED)
+    if (data == MAP_FAILED) {
+        display->frameSubmitted = false;
         return false;
+    }
 
     CopyTiles(display, imgData, data, tileCount);
     const int commandSize = WriteCommands(display, &dirtyFrame, tileCount, frame_id, displayId);
     if (commandSize == 0) {
         munmap(data, display->dataSize);
+        display->frameSubmitted = false;
         return false;
     }
 
     // 호출 후에는 성공/실패 모두 XRDP가 mmap 버퍼를 해제하므로 우리쪽에서 절대로 해제하면 안됨!
     if (mod->server_egfx_cmd((struct mod*)mod, (char*)_drawCmd->data_start, commandSize, data, (int)display->dataSize) != 0) {
+        display->frameSubmitted = false;
         return false;
     }
 
