@@ -3,289 +3,289 @@
 #include "../osxup.h"
 #include <sys/mman.h>
 
-static const short XR_RDPGFX_CMDID_WIRETOSURFACE_2 = 0x0002;
-static const short XR_RDPGFX_CODECID_CAPROGRESSIVE = 0x0009;
-static const char XR_PIXEL_FORMAT_XRGB_8888 = 0x20;
+static const int RFX_TILE_BYTES = 64 * 64 * 4;
+static const int RFX_TILES_PER_COMMAND = 2048;
 
-typedef struct _XRDP_EFGX_CMD_HEADER {
-    short cmdId;
-    short flags;
-    int pduLength; // header + body size
-} __attribute__((packed)) XRDP_EFGX_CMD_HEADER;
-
-typedef struct _XRDP_EGFX_CREATE_SURFACE {
-    XRDP_EFGX_CMD_HEADER header;
-    short surfaceId;
-    short width;
-    short height;
-    char fmt;
-} __attribute__((packed)) XRDP_EGFX_CREATE_SURFACE;
-
-typedef struct _XRDP_EGFX_START_FRAME {
-    XRDP_EFGX_CMD_HEADER header;
-    int frame_id;
-    int timestamp;
-} __attribute__((packed)) XRDP_EGFX_START_FRAME;
-
-typedef struct _XRDP_EGFX_END_FRAME {
-    XRDP_EFGX_CMD_HEADER header;
-    int frame_id;
-} __attribute__((packed)) XRDP_EGFX_END_FRAME;
-
-typedef struct _XRDP_EGFX_MAP_SURFACE_TO_OUTPUT {
-    XRDP_EFGX_CMD_HEADER header;
-    short surfaceId;
-    int outputX;
-    int outputY;
-} __attribute__((packed)) XRDP_EGFX_MAP_SURFACE_TO_OUTPUT;
-
-typedef struct _XRDP_EGFX_RESET_GRAPHICS_PDU {
-    XRDP_EFGX_CMD_HEADER header;
-    int width;
-    int height;
-    int monitor_count;
-    // TODO : dynamic
-    int left;
-    int top;
-    int right;
-    int bottom;
-    int is_primary;
-} __attribute__((packed)) XRDP_EGFX_RESET_GRAPHICS_PDU;
-
-static inline int
-clamp_int(int value, int min_value, int max_value) {
-    if (value < min_value) {
-        return min_value;
-    }
-    
-    if (value > max_value) {
-        return max_value;
-    }
-    return value;
+PaintRFX::PaintRFX() :
+    _drawCmd(NULL)
+{
+    memset(_displays, 0, sizeof(_displays));
 }
 
 void PaintRFX::Initialize(const struct mod* mod) {
-    /*
-    XRDP_EGFX_RESET_GRAPHICS_PDU reset;
-    reset.header.cmdId = 0x0E;
-    reset.header.flags = 0;
-    reset.header.pduLength = sizeof(reset);
-    
-    reset.width = mod->width;
-    reset.height = mod->height;
-    reset.monitor_count = 1;
-    reset.top = 0;
-    reset.left = 0;
-    reset.right = mod->width;
-    reset.bottom = mod->height;
-    reset.is_primary = 1;
-    
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&reset, sizeof(reset), NULL, 0);
-    
-    XRDP_EGFX_CREATE_SURFACE createSurface;
-    createSurface.header.cmdId = 0x0009;
-    createSurface.header.flags = 0;
-    createSurface.header.pduLength = sizeof(createSurface);
-    
-    createSurface.surfaceId = 0;
-    createSurface.width = mod->width;
-    createSurface.height = mod->height;
-    createSurface.fmt = 0x20;
-    
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&createSurface, sizeof(createSurface), NULL, 0);
-    
-    XRDP_EGFX_MAP_SURFACE_TO_OUTPUT output;
-    output.header.cmdId = 0x0F;
-    output.header.flags = 0;
-    output.header.pduLength = sizeof(output);
-    
-    output.surfaceId = 0;
-    output.outputX = 0;
-    output.outputY = 0;
-    
-    mod->server_egfx_cmd((struct mod*)mod, (char*)&output, sizeof(output), NULL, 0);
-    */
-    _width = mod->width;
-    _height = mod->height;
-    _tileCols = (_width + 63) / 64;
-    _tileRows = (_height + 63) / 64;
-    _tileTotal = _tileCols * _tileRows;
-    _srcStride = _width * 3;
-    _dstStride = _tileCols * 256;
-    _dstHeight = _tileRows * 64;
-    _srcMinSize = (size_t)_srcStride * (size_t)_height;
-    _tileDataSize = (size_t)_dstStride * (size_t)_dstHeight;
-    
-    if (_tileCols <= 0 || _tileRows <= 0 || _tileTotal <= 0 || _tileDataSize == 0) {
-        Release();
-        return;
-    }
-    
-    _drawCmd = xstream_create(512 * 1024 * 2);
-    _tileRects = (TileRect*)malloc(sizeof(TileRect) * (size_t)_tileTotal);
+    Release();
 
-    if (_drawCmd == NULL || _tileRects == NULL) {
-        Release();
-        return;
-    }
-    
-    // 64x64 단위의 타일 만들기
-    for (int ty = 0; ty < _tileRows; ++ty) {
-        for (int tx = 0; tx < _tileCols; ++tx) {
-            const int idx = (ty * _tileCols) + tx;
-            const int left = tx * 64;
-            const int top = ty * 64;
-            
-            _tileRects[idx].left = (short)left;
-            _tileRects[idx].top = (short)top;
-            _tileRects[idx].width = (short)((_width - left < 64) ? (_width - left) : 64);
-            _tileRects[idx].height = (short)((_height - top < 64) ? (_height - top) : 64);
+    int monitorCount = mod->client_info.display_sizes.monitorCount;
+    if (monitorCount == 0)
+        monitorCount = 1;
+
+    if (monitorCount > 16)
+        monitorCount = 16;
+
+    for (int i = 0; i < monitorCount; i++) {
+        DisplayData* display = &_displays[i];
+        int width = mod->width;
+        int height = mod->height;
+        if (mod->client_info.display_sizes.monitorCount > 0) {
+            const struct monitor_info* monitor = &mod->client_info.display_sizes.minfo_wm[i];
+            width = monitor->right - monitor->left;
+            height = monitor->bottom - monitor->top;
+
+            if (!(monitorCount == 1 && monitor->left == 0 && monitor->right == mod->width))
+                width++;
+            if (!(monitorCount == 1 && monitor->top == 0 && monitor->bottom == mod->height))
+                height++;
         }
+
+        display->width = width & ~1;
+        display->height = height & ~1;
+        if (display->width > 32767 || display->height > 32767)
+            continue;
+
+        // payload는 전체 격자의 주소 공간을 사용한다. 타일 하나는 Y/U/V/A 각 4096바이트이다.
+        display->tileCols = (display->width + 63) / 64;
+        display->tileRows = (display->height + 63) / 64;
+        display->tileTotal = display->tileCols * display->tileRows;
+        display->dataSize = (size_t)display->tileTotal * RFX_TILE_BYTES;
+
+        if (display->dataSize > 0x7FFFFFFF)
+            continue;
+
+        display->tiles = (TileData*)malloc(display->tileTotal * sizeof(TileData));
+        display->selected = (bool*)calloc(display->tileTotal, sizeof(bool));
+        display->tileIndices = (int*)malloc(display->tileTotal * sizeof(int));
+        if (display->tiles == NULL || display->selected == NULL || display->tileIndices == NULL)
+            continue;
+
+        // 디스플레이 정보 (크기 등) 은 원격 세선동안 바뀌지 않으므로 미리 계산
+        for (int j = 0; j < display->tileTotal; j++) {
+            TileData* tile = &display->tiles[j];
+            tile->rect.x = (j % display->tileCols) * 64;
+            tile->rect.y = (j / display->tileCols) * 64;
+            tile->rect.width = display->width - tile->rect.x < 64 ? display->width - tile->rect.x : 64;
+            tile->rect.height = display->height - tile->rect.y < 64 ? display->height - tile->rect.y : 64;
+            tile->srcOffset = ((size_t)tile->rect.y * display->width + tile->rect.x) * 3;
+            tile->dstOffset = (size_t)j * RFX_TILE_BYTES;
+        }
+
+        display->valid = 1;
     }
 }
 
 void PaintRFX::Release() {
-    if (_drawCmd != NULL) {
-        xstream_free(_drawCmd);
-        _drawCmd = NULL;
+    xstream_free(_drawCmd);
+    _drawCmd = NULL;
+
+    for (int i = 0; i < 16; i++) {
+        free(_displays[i].tiles);
+        free(_displays[i].selected);
+        free(_displays[i].tileIndices);
     }
 
-    if (_tileRects != NULL) {
-        free(_tileRects);
-        _tileRects = NULL;
-    }
-    
-    _width = 0;
-    _height = 0;
-    _tileCols = 0;
-    _tileRows = 0;
-    _tileTotal = 0;
-    _srcStride = 0;
-    _dstStride = 0;
-    _dstHeight = 0;
-    _srcMinSize = 0;
-    _tileDataSize = 0;
+    memset(_displays, 0, sizeof(_displays));
 }
 
 void PaintRFX::DoPaint(const struct mod* mod, screenrecord_frame_t* frameInfo, char* imgData, size_t imgDataSize, int frame_id, int displayId, int width, int height) {
     assert(mod != NULL);
     assert(frameInfo != NULL);
     assert(imgData != NULL);
-    assert(_drawCmd != NULL);
-    assert(_tileRects != NULL);
 
-    (void)width;
-    (void)height;
-
-    if (mod->width != _width || mod->height != _height) {
+    if (SubmitFrame(mod, frameInfo, imgData, imgDataSize, frame_id, displayId, width, height) == false) {
         return;
     }
+}
 
-    if (_tileDataSize == 0 || _tileTotal <= 0) {
-        return;
+bool PaintRFX::SubmitFrame(const struct mod* mod, screenrecord_frame_t* frameInfo, char* imgData, size_t imgDataSize, int frame_id, int displayId, int width, int height) {
+    if (displayId < 0 || displayId >= 16) return false;
+
+    DisplayData* display = &_displays[displayId];
+
+    if (display->valid == 0) {
+        return false;
     }
 
-    if (imgDataSize < sizeof(int)) {
-        return;
+    if (display->tiles == NULL || width != display->width || height != display->height ||
+        imgDataSize < (size_t)width * height * 3) {
+        // 제출에 실패한 프레임의 dirty 영역은 다시 보내지지 않으므로, 다음 프레임을 full redraw 로 돌려 복구한다.
+        display->frameSubmitted = false;
+        return false;
     }
 
-    const unsigned char* slot = (const unsigned char*)imgData;
-    int slotTileCount = 0;
-    memcpy(&slotTileCount, slot, sizeof(int));
+    screenrecord_frame_t dirtyFrame;
+    const int tileCount = SelectTiles(display, frameInfo, &dirtyFrame);
 
-    if (slotTileCount <= 0 || slotTileCount > _tileTotal) {
-        return;
+    char* data = (char*)mmap(NULL, display->dataSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (data == MAP_FAILED) {
+        display->frameSubmitted = false;
+        return false;
     }
 
-    // slot 크기 검증: header(int) + indices(int*n) + tileData(16384*n)
-    const size_t expected = sizeof(int) + sizeof(int) * (size_t)slotTileCount + (size_t)slotTileCount * OSXRDP_RFX_TILE_BYTES;
-    if (imgDataSize < expected) {
-        return;
+    CopyTiles(display, imgData, data, tileCount);
+    const int commandSize = WriteCommands(display, &dirtyFrame, tileCount, frame_id, displayId);
+    if (commandSize == 0) {
+        munmap(data, display->dataSize);
+        display->frameSubmitted = false;
+        return false;
     }
 
-    const int* slotIndices = (const int*)(slot + sizeof(int));
-    const unsigned char* slotTileData = (const unsigned char*)(slotIndices + slotTileCount);
+    // 호출 후에는 성공/실패 모두 XRDP가 mmap 버퍼를 해제하므로 우리쪽에서 절대로 해제하면 안됨!
+    if (mod->server_egfx_cmd((struct mod*)mod, (char*)_drawCmd->data_start, commandSize, data, (int)display->dataSize) != 0) {
+        display->frameSubmitted = false;
+        return false;
+    }
 
-    XRDP_EGFX_START_FRAME startCmd;
-    startCmd.header.cmdId = 11;
-    startCmd.header.flags = 0;
-    startCmd.header.pduLength = sizeof(startCmd);
-    startCmd.timestamp = 0;
-    startCmd.frame_id = frame_id;
+    display->frameSubmitted = true;
+    return true;
+}
+
+int PaintRFX::SelectTiles(DisplayData* display, const screenrecord_frame_t* frameInfo, screenrecord_frame_t* dirtyFrame) {
+    const int width = display->width;
+    const int height = display->height;
+
+    RECT* dirtys = dirtyFrame->dirtys;
+    int& dirtyCount = dirtyFrame->dirtyCount;
+    dirtyCount = 0;
+ 
+    if (display->frameSubmitted && frameInfo->dirtyCount > 0 && frameInfo->dirtyCount <= MAX_DIRTY_COUNT) {
+        for (int i = 0; i < frameInfo->dirtyCount; i++) {
+            const RECT* rect = &frameInfo->dirtys[i];
+
+            int left = rect->x < 0 ? 0 : rect->x;
+            int top = rect->y < 0 ? 0 : rect->y;
+            int right = rect->x + rect->width;
+            int bottom = rect->y + rect->height;
+
+            if (right > width)
+                right = width;
+
+            if (bottom > height)
+                bottom = height;
+
+            if (right <= left || bottom <= top) continue;
+
+            dirtys[dirtyCount].x = left;
+            dirtys[dirtyCount].y = top;
+            dirtys[dirtyCount].width = right - left;
+            dirtys[dirtyCount].height = bottom - top;
+
+            dirtyCount++;
+        }
+    }
+
+    // full redraw
+    if (dirtyCount == 0) {
+        dirtys[0].x = 0;
+        dirtys[0].y = 0;
+        dirtys[0].width = width;
+        dirtys[0].height = height;
+        dirtyCount = 1;
+    }
+
+    int tileCount = 0;
+    for (int i = 0; i < dirtyCount; i++) {
+        const RECT* rect = &dirtys[i];
+        const int right = (rect->x + rect->width + 63) / 64;
+        const int bottom = (rect->y + rect->height + 63) / 64;
+        for (int y = rect->y / 64; y < bottom; y++) {
+            for (int x = rect->x / 64; x < right; x++) {
+                const int index = y * display->tileCols + x;
+                if (display->selected[index])
+                    continue;
+                
+                display->selected[index] = true;
+                display->tileIndices[tileCount++] = index;
+            }
+        }
+    }
+
+    for (int i = 0; i < tileCount; i++) {
+        display->selected[display->tileIndices[i]] = false;
+    }
+    return tileCount;
+}
+
+void PaintRFX::CopyTiles(const DisplayData* display, const char* imgData, char* data, int tileCount) {
+    for (int i = 0; i < tileCount; i++) {
+        const int index = display->tileIndices[i];
+        const TileData* tile = &display->tiles[index];
+        CopyRFXTile((const unsigned char*)imgData + tile->srcOffset, display->width * 3, (unsigned char*)data + tile->dstOffset, tile->rect.width, tile->rect.height);
+    }
+    
+}
+
+int PaintRFX::WriteCommands(const DisplayData* display, const screenrecord_frame_t* dirtyFrame, int tileCount, int frame_id, int displayId) {
+    const RECT* dirtys = dirtyFrame->dirtys;
+    const int dirtyCount = dirtyFrame->dirtyCount;
+    const int commandCount = (tileCount + RFX_TILES_PER_COMMAND - 1) / RFX_TILES_PER_COMMAND;
+    const int commandSize = 28 + commandCount * (33 + dirtyCount * 8) + tileCount * 8;
+    
+    if (_drawCmd == NULL || _drawCmd->size < commandSize) {
+        xstream_free(_drawCmd);
+        _drawCmd = xstream_create(commandSize);
+    }
+
+    if (_drawCmd == NULL) {
+        return 0;
+    }
 
     xstream_resetPos(_drawCmd);
-    xstream_writeData(_drawCmd, &startCmd, sizeof(startCmd));
+    xstream_writeInt16(_drawCmd, 0x000B); // STARTFRAME
+    xstream_writeInt16(_drawCmd, 0);
+    xstream_writeInt32(_drawCmd, 16);
+    xstream_writeInt32(_drawCmd, frame_id);
+    xstream_writeInt32(_drawCmd, 0); // timestamp
 
-    char* wire_start_ptr = (char*)_drawCmd->data_current;
-
-    // header
-    xstream_writeInt16(_drawCmd, XR_RDPGFX_CMDID_WIRETOSURFACE_2);  // cmdId
-    xstream_writeInt16(_drawCmd, 0);                                // flags
-    xstream_writeInt32(_drawCmd, 0);                                // len
-
-    // body
-    xstream_writeInt16(_drawCmd, displayId);                        // surface_id
-    xstream_writeInt16(_drawCmd, XR_RDPGFX_CODECID_CAPROGRESSIVE);  // codec_id
-    xstream_writeInt32(_drawCmd, 0);                                // codec_context_id
-    xstream_writeInt8(_drawCmd,  XR_PIXEL_FORMAT_XRGB_8888);        // pixel_format
-    xstream_writeInt32(_drawCmd, 0);                                // flags
-
-    // RFX progressive 처리를 위해 정렬된 (64) dirty area 를 설정
-    // producer 가 보낸 slot indices 를 그대로 사용 — frameInfo->dirtys 는 RFX 경로에서는 참고하지 않는다.
-    xstream_writeInt16(_drawCmd, slotTileCount); // num_rects_d
-    for (int i = 0; i < slotTileCount; ++i) {
-        const int tileIdx = slotIndices[i];
-        if (tileIdx < 0 || tileIdx >= _tileTotal) {
-            return; // 손상된 slot
+    for (int i = 0; i < tileCount; i += RFX_TILES_PER_COMMAND) {
+        const int count = tileCount - i < RFX_TILES_PER_COMMAND ? tileCount - i : RFX_TILES_PER_COMMAND;
+        xstream_writeInt16(_drawCmd, 0x0002); // WIRETOSURFACE_2
+        xstream_writeInt16(_drawCmd, 0);
+        xstream_writeInt32(_drawCmd, 33 + (dirtyCount + count) * 8);
+        xstream_writeInt16(_drawCmd, displayId);
+        xstream_writeInt16(_drawCmd, 0x0009); // CAPROGRESSIVE
+        xstream_writeInt32(_drawCmd, 0); // codec_context_id
+        xstream_writeInt8(_drawCmd, 0x20); // XRGB_8888
+        xstream_writeInt32(_drawCmd, (unsigned int)displayId << 28);
+        WriteRFXRects(_drawCmd, dirtys, dirtyCount);
+        xstream_writeInt16(_drawCmd, count);
+        
+        for (int j = 0; j < count; j++) {
+            const RECT* rect = &display->tiles[display->tileIndices[i + j]].rect;
+            xstream_writeInt16(_drawCmd, rect->x);
+            xstream_writeInt16(_drawCmd, rect->y);
+            xstream_writeInt16(_drawCmd, rect->width);
+            xstream_writeInt16(_drawCmd, rect->height);
         }
-        const TileRect* rect = &_tileRects[tileIdx];
-        xstream_writeInt16(_drawCmd, rect->left);
-        xstream_writeInt16(_drawCmd, rect->top);
-        xstream_writeInt16(_drawCmd, rect->width);
-        xstream_writeInt16(_drawCmd, rect->height);
+        
+        xstream_writeInt32(_drawCmd, 0); // left, top
+        xstream_writeInt16(_drawCmd, display->width);
+        xstream_writeInt16(_drawCmd, display->height);
     }
 
-    xstream_writeInt16(_drawCmd, slotTileCount); // num_rects_c
-    for (int i = 0; i < slotTileCount; ++i) {
-        const int tileIdx = slotIndices[i];
-        const TileRect* rect = &_tileRects[tileIdx];
-        xstream_writeInt16(_drawCmd, rect->left);
-        xstream_writeInt16(_drawCmd, rect->top);
-        xstream_writeInt16(_drawCmd, rect->width);
-        xstream_writeInt16(_drawCmd, rect->height);
+    xstream_writeInt16(_drawCmd, 0x000C); // ENDFRAME
+    xstream_writeInt16(_drawCmd, 0);
+    xstream_writeInt32(_drawCmd, 12);
+    xstream_writeInt32(_drawCmd, frame_id);
+
+    return commandSize;
+}
+
+void PaintRFX::CopyRFXTile(const unsigned char* src, int stride, unsigned char* dst, int width, int height) {
+    for (int y = 0; y < height; y++) {
+        const unsigned char* row = src + y * stride;
+        for (int x = 0; x < width; x++) {
+            dst[y * 64 + x] = row[x * 3 + 1];          // Y
+            dst[4096 + y * 64 + x] = row[x * 3 + 2];   // Cb
+            dst[8192 + y * 64 + x] = row[x * 3];       // Cr
+        }
     }
+}
 
-    xstream_writeInt32(_drawCmd, 0);
-    xstream_writeInt16(_drawCmd, _width);
-    xstream_writeInt16(_drawCmd, _height);
-
-    int dataLen = (int)((char*)_drawCmd->data_current - wire_start_ptr);
-
-    *(int*)(wire_start_ptr + sizeof(int)) = dataLen;
-
-    XRDP_EGFX_END_FRAME endCmd;
-    endCmd.header.cmdId = 12;
-    endCmd.header.flags = 0;
-    endCmd.header.pduLength = sizeof(endCmd);
-    endCmd.frame_id = frame_id;
-
-    xstream_writeData(_drawCmd, &endCmd, sizeof(endCmd));
-
-    void* mapped = mmap(NULL, _tileDataSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mapped == MAP_FAILED) {
-        return;
+void PaintRFX::WriteRFXRects(xstream_t* stream, const RECT* rects, int count) {
+    xstream_writeInt16(stream, count);
+    for (int i = 0; i < count; i++) {
+        xstream_writeInt16(stream, rects[i].x);
+        xstream_writeInt16(stream, rects[i].y);
+        xstream_writeInt16(stream, rects[i].width);
+        xstream_writeInt16(stream, rects[i].height);
     }
-
-    unsigned char* dst = (unsigned char*)mapped;
-    const size_t tileSize = 16384; // 64 x 64 x (Y + U + V + A)
-
-    for (int i = 0; i < slotTileCount; ++i) {
-        const int tileIdx = slotIndices[i];
-        memcpy(dst + (size_t)tileIdx * tileSize,
-               slotTileData + (size_t)i * tileSize,
-               tileSize);
-    }
-
-    dataLen = (int)((char*)_drawCmd->data_current - (char*)_drawCmd->data_start);
-    mod->server_egfx_cmd((struct mod*)mod, (char*)_drawCmd->data_start, dataLen, (char*)mapped, (int)_tileDataSize);
 }
