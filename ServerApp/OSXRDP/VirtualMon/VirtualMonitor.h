@@ -33,7 +33,8 @@ public:
     bool DisableOtherMonitors();
     
     // 비활성화 하였던 나머지 모니터들을 다시 활성화
-    void RestoreOtherMonitors();
+    void RestoreOtherMonitors(int verifyTimeoutMs = 1000);
+    void RestoreOtherMonitorsAfterDisplayWake();
     
     void StartMonitor();
     
@@ -63,9 +64,6 @@ private:
     int _virtualDisplayInfoCnt;
 
     bool _init;
-    
-    uint32_t* _disabledDisplayIds;
-    int _disabledDisplayIdsCnt;
     
     pthread_t _watchThread;
     pthread_mutex_t _watchLock;

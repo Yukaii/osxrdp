@@ -2,9 +2,45 @@
 #include "DisplayUtils.h"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <crt_externs.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static const int kDisplayReconfigSettleUsec = 500 * 1000;
+static const int kRestoreAwakeVerifyMs = 5000;
+static const int kHelperProcessTimeoutMs = 5000;
+static const int kDisplaySleepSettleUsec = 1500 * 1000;
+static const int kDisplayWakeSettleUsec = 1500 * 1000;
+
+static const int kVirtualDisplayVendorId = 0x1207;
+static const int kVirtualDisplayProductIdBase = 0x5969;
+
+// Restore state must survive ScreenRecorderManager/VirtualMonitor teardown.
+// A failed WindowServer reconfiguration otherwise loses the physical display ID.
+// Every client owns its own VirtualMonitor, so guard the shared list.
+static uint32_t* gDisabledDisplayIds = NULL;
+static int gDisabledDisplayIdsCnt = 0;
+static pthread_mutex_t gDisabledDisplayLock = PTHREAD_MUTEX_INITIALIZER;
+
+static int RunProcess(char* const* argv, int timeoutMs);
+static bool EnableDisplaysInHelperProcess(uint32_t* displayIds, int displayCnt);
+
+static bool HasPendingRestore() {
+    pthread_mutex_lock(&gDisabledDisplayLock);
+    bool pending = gDisabledDisplayIdsCnt > 0;
+    pthread_mutex_unlock(&gDisabledDisplayLock);
+    return pending;
+}
+
+// Virtual displays created by any VirtualMonitor instance (see Create).
+// During a client handoff two instances coexist, and one must not disable
+// (and later try to "restore") the other's virtual display.
+static bool IsOsxrdpVirtualDisplay(CGDirectDisplayID displayId) {
+    uint32_t productId = CGDisplayModelNumber(displayId);
+    return CGDisplayVendorNumber(displayId) == kVirtualDisplayVendorId &&
+           productId >= kVirtualDisplayProductIdBase && productId < kVirtualDisplayProductIdBase + 16;
+}
 
 // 가상 모니터 해상도 목록
 //  이와 같이 구성을 채우지 않으면 macOS 가 이를 모니터가 아닌 다른 무언가로 인식하여 대화상자를 띄우는것 같음 (airplay 수신기?)
@@ -17,8 +53,6 @@ static const int baseModes[][2] = {
 VirtualMonitor::VirtualMonitor() :
     _virtualDisplayInfoCnt(0),
     _init(false),
-    _disabledDisplayIds(NULL),
-    _disabledDisplayIdsCnt(0),
     _watchRunning(false),
     _displaySleepAssertion(kIOPMNullAssertionID)
 {
@@ -126,7 +160,7 @@ void VirtualMonitor::Destroy() {
         pthread_join(_watchThread, NULL); // 완전히 정지할때까지 대기
     }
 
-    if (_disabledDisplayIdsCnt > 0) {
+    if (HasPendingRestore()) {
         WakeupDisplay();
         usleep(kDisplayReconfigSettleUsec);
     }
@@ -134,7 +168,10 @@ void VirtualMonitor::Destroy() {
     // 비활성화한 디스플레이 롤백 (반드시 먼저 해야함, 그렇지 않는 경우 위 설명처럼 windowserver 가 크래시할 수 있음)
     RestoreOtherMonitors();
 
-    for (int i = 0; i < _virtualDisplayInfoCnt; i++) {
+    CGDirectDisplayID virtualIds[16] = {0};
+    int virtualCnt = _virtualDisplayInfoCnt;
+    for (int i = 0; i < virtualCnt; i++) {
+        virtualIds[i] = _virtualDisplayInfo[i].virtualDisplay.displayID;
         // nil 로 설정하면 알아서 뽀개짐 (즉시 뽀개지는건 아님)
         _virtualDisplayInfo[i].virtualDisplay = nil;
     }
@@ -144,19 +181,137 @@ void VirtualMonitor::Destroy() {
 
     _init = false;
     ReleaseDisplaySleepAssertion();
+
+    // WindowServer may reject re-enabling the physical panel while a virtual
+    // display is still active. Retry only after the virtual displays are gone.
+    if (HasPendingRestore() && virtualCnt > 0) {
+        for (int i = 0; i < virtualCnt; i++) {
+            DisplayUtils::WaitDisplayOnlineState(virtualIds[i], false, 5000);
+        }
+        WakeupDisplay();
+        usleep(kDisplayReconfigSettleUsec);
+        RestoreOtherMonitors();
+
+        // Disabling the panel also makes its hardware report "out", and
+        // SkyLight refuses to enable it again (kCGErrorFailure, or the request
+        // is silently dropped) until a display wake re-probes the panel and
+        // it reports "in". Sleep the display, wake it, then retry.
+        if (HasPendingRestore()) {
+            NSLog(@"[VirtualMonitor::Destroy] physical display still disabled; cycling display sleep");
+            RestoreOtherMonitorsAfterDisplayWake();
+        }
+    }
 }
 
-void VirtualMonitor::RestoreOtherMonitors() {
-    if (_disabledDisplayIdsCnt == 0 || _disabledDisplayIds == NULL) {
+void VirtualMonitor::RestoreOtherMonitors(int verifyTimeoutMs) {
+    pthread_mutex_lock(&gDisabledDisplayLock);
+
+    if (gDisabledDisplayIdsCnt == 0 || gDisabledDisplayIds == NULL) {
+        pthread_mutex_unlock(&gDisabledDisplayLock);
         return;
     }
     
-    DisplayUtils::ApplyDisplayEnabled(_disabledDisplayIds, _disabledDisplayIdsCnt, true);
+    bool applied = EnableDisplaysInHelperProcess(gDisabledDisplayIds, gDisabledDisplayIdsCnt);
     
-    free(_disabledDisplayIds);
+    // Keep only the displays that did not come back, so a later retry does not
+    // reconfigure displays that are already restored.
+    int pendingCnt = 0;
+    for (int i = 0; i < gDisabledDisplayIdsCnt; i++) {
+        if (!DisplayUtils::WaitDisplayOnlineState(gDisabledDisplayIds[i], true, verifyTimeoutMs)) {
+            gDisabledDisplayIds[pendingCnt++] = gDisabledDisplayIds[i];
+        }
+    }
+    gDisabledDisplayIdsCnt = pendingCnt;
     
-    _disabledDisplayIds = NULL;
-    _disabledDisplayIdsCnt = 0;
+    if (pendingCnt == 0) {
+        free(gDisabledDisplayIds);
+        gDisabledDisplayIds = NULL;
+    } else {
+        NSLog(@"[VirtualMonitor::RestoreOtherMonitors] restore incomplete; applied=%d pending=%d",
+              applied, pendingCnt);
+    }
+
+    pthread_mutex_unlock(&gDisabledDisplayLock);
+}
+
+void VirtualMonitor::RestoreOtherMonitorsAfterDisplayWake() {
+    // Same request as `pmset displaysleepnow`.
+    char* sleepArgv[] = { (char*)"/usr/bin/pmset", (char*)"displaysleepnow", NULL };
+    if (RunProcess(sleepArgv, kHelperProcessTimeoutMs) != 0) {
+        NSLog(@"[VirtualMonitor::RestoreOtherMonitorsAfterDisplayWake] display sleep request failed");
+    }
+    usleep(kDisplaySleepSettleUsec);
+
+    // Same as `caffeinate -u`; keep it declared until the restore is verified.
+    IOPMAssertionID wakeAssertion = kIOPMNullAssertionID;
+    IOPMAssertionDeclareUserActivity(CFSTR("OSXRDP: restore physical display"), kIOPMUserActiveLocal, &wakeAssertion);
+
+    // Give the panel time to report "in" after the wake before enabling it.
+    usleep(kDisplayWakeSettleUsec);
+    RestoreOtherMonitors(kRestoreAwakeVerifyMs);
+
+    if (wakeAssertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(wakeAssertion);
+    }
+}
+
+// Returns the exit status, or -1 if the process could not run to completion.
+static int RunProcess(char* const* argv, int timeoutMs) {
+    // Do not leak the agent's IPC sockets into the child.
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+
+    pid_t pid = 0;
+    int spawnErr = posix_spawn(&pid, argv[0], NULL, &attr, argv, *_NSGetEnviron());
+    posix_spawnattr_destroy(&attr);
+
+    if (spawnErr != 0) {
+        NSLog(@"[VirtualMonitor::RunProcess] posix_spawn failed path=%s err=%d", argv[0], spawnErr);
+        return -1;
+    }
+
+    int status = 0;
+    for (int waitedMs = 0; waitpid(pid, &status, WNOHANG) == 0; waitedMs += 50) {
+        if (waitedMs >= timeoutMs) {
+            NSLog(@"[VirtualMonitor::RunProcess] timed out path=%s pid=%d", argv[0], pid);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+        usleep(50 * 1000);
+    }
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Enable requests made from this long-running process can be dropped by
+// SkyLight without reaching WindowServer, while the same request from a fresh
+// process is delivered. Run this executable in its --enable-displays helper
+// mode (see main.m).
+static bool EnableDisplaysInHelperProcess(uint32_t* displayIds, int displayCnt) {
+    NSString* executablePath = [[NSBundle mainBundle] executablePath];
+    if (executablePath == nil || displayCnt <= 0 || displayCnt > 16) {
+        return DisplayUtils::ApplyDisplayEnabled(displayIds, displayCnt, true);
+    }
+
+    char idArgs[16][16];
+    char* argv[16 + 3];
+    int argc = 0;
+    argv[argc++] = (char*)[executablePath fileSystemRepresentation];
+    argv[argc++] = (char*)"--enable-displays";
+    for (int i = 0; i < displayCnt; i++) {
+        snprintf(idArgs[i], sizeof(idArgs[i]), "%u", displayIds[i]);
+        argv[argc++] = idArgs[i];
+    }
+    argv[argc] = NULL;
+
+    int exitStatus = RunProcess(argv, kHelperProcessTimeoutMs);
+    if (exitStatus == -1) {
+        return DisplayUtils::ApplyDisplayEnabled(displayIds, displayCnt, true);
+    }
+
+    return exitStatus == 0;
 }
 
 void VirtualMonitor::StartMonitor() {
@@ -200,7 +355,7 @@ void VirtualMonitor::ReleaseDisplaySleepAssertion() {
 
 // todo: DisplayUtils::ApplyDisplayEnabled 에 중복 로직이 있음
 bool VirtualMonitor::DisableOtherMonitors() {
-    NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors begin virtualDisplayCnt=%d disabledCnt=%d]", _virtualDisplayInfoCnt, _disabledDisplayIdsCnt);
+    NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors begin virtualDisplayCnt=%d disabledCnt=%d]", _virtualDisplayInfoCnt, gDisabledDisplayIdsCnt);
     
     // 가상 디스플레이가 없으면 무시
     if (_virtualDisplayInfoCnt <= 0) {
@@ -235,7 +390,7 @@ bool VirtualMonitor::DisableOtherMonitors() {
 
     bool hasPhysicalOnlineDisplay = false;
     for (uint32_t i = 0; i < displayCnt; i++) {
-        if (IsVirtualDisplay(displayIds[i]) == false) {
+        if (IsVirtualDisplay(displayIds[i]) == false && IsOsxrdpVirtualDisplay(displayIds[i]) == false) {
             hasPhysicalOnlineDisplay = true;
             break;
         }
@@ -246,30 +401,34 @@ bool VirtualMonitor::DisableOtherMonitors() {
         return true;
     }
     
-    uint32_t* newDisabledDisplayIds = (uint32_t*)realloc(_disabledDisplayIds, sizeof(uint32_t) * (_disabledDisplayIdsCnt + displayCnt));
+    pthread_mutex_lock(&gDisabledDisplayLock);
+
+    uint32_t* newDisabledDisplayIds = (uint32_t*)realloc(gDisabledDisplayIds, sizeof(uint32_t) * (gDisabledDisplayIdsCnt + displayCnt));
     if (newDisabledDisplayIds == NULL) {
-        NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors failed reason=realloc oldCnt=%d addCnt=%u]", _disabledDisplayIdsCnt, displayCnt);
+        NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors failed reason=realloc oldCnt=%d addCnt=%u]", gDisabledDisplayIdsCnt, displayCnt);
+        pthread_mutex_unlock(&gDisabledDisplayLock);
         free(displayIds);
         return false;
     }
     
-    _disabledDisplayIds = newDisabledDisplayIds;
+    gDisabledDisplayIds = newDisabledDisplayIds;
     
     CGDisplayConfigRef cfg = NULL;
     CGError beginErr = CGBeginDisplayConfiguration(&cfg);
     if (beginErr != kCGErrorSuccess || cfg == NULL) {
         NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors failed reason=beginConfiguration err=%d cfg=%p]", beginErr, cfg);
+        pthread_mutex_unlock(&gDisabledDisplayLock);
         free(displayIds);
         
         return false;
     }
     
-    int newDisabledDisplayIdsCnt = _disabledDisplayIdsCnt;
+    int newDisabledDisplayIdsCnt = gDisabledDisplayIdsCnt;
     
     for (uint32_t i = 0; i < displayCnt; i++) {
         NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors check id=%u index=%u]", displayIds[i], i);
         
-        if (IsVirtualDisplay(displayIds[i])) {
+        if (IsVirtualDisplay(displayIds[i]) || IsOsxrdpVirtualDisplay(displayIds[i])) {
             NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors skip virtual id=%u]", displayIds[i]);
             continue;
         }
@@ -279,8 +438,8 @@ bool VirtualMonitor::DisableOtherMonitors() {
         NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors configure id=%u enabled=0 err=%d]", displayIds[i], configureErr);
         
         bool exists = false;
-        for (int j = 0; j < _disabledDisplayIdsCnt; j++) {
-            if (_disabledDisplayIds[j] == displayIds[i]) {
+        for (int j = 0; j < gDisabledDisplayIdsCnt; j++) {
+            if (gDisabledDisplayIds[j] == displayIds[i]) {
                 exists = true;
                 break;
             }
@@ -288,7 +447,7 @@ bool VirtualMonitor::DisableOtherMonitors() {
         
         if (exists == false) {
             // 나중에 복원할 수 있도록 id 를 저장
-            _disabledDisplayIds[newDisabledDisplayIdsCnt] = displayIds[i];
+            gDisabledDisplayIds[newDisabledDisplayIdsCnt] = displayIds[i];
             newDisabledDisplayIdsCnt++;
             NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors add disabled id=%u newCnt=%d]", displayIds[i], newDisabledDisplayIdsCnt);
         }
@@ -300,14 +459,16 @@ bool VirtualMonitor::DisableOtherMonitors() {
     // 설정 저장
     CGError completeErr = CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly);
     if (completeErr != kCGErrorSuccess) {
-        NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors failed reason=complete err=%d oldCnt=%d newCnt=%d]", completeErr, _disabledDisplayIdsCnt, newDisabledDisplayIdsCnt);
+        NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors failed reason=complete err=%d oldCnt=%d newCnt=%d]", completeErr, gDisabledDisplayIdsCnt, newDisabledDisplayIdsCnt);
+        pthread_mutex_unlock(&gDisabledDisplayLock);
         free(displayIds);
         return false;
     }
     
-    _disabledDisplayIdsCnt = newDisabledDisplayIdsCnt;
-    NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors success disabledCnt=%d]", _disabledDisplayIdsCnt);
+    gDisabledDisplayIdsCnt = newDisabledDisplayIdsCnt;
+    NSLog(@"[VirtualMonDebugMsg : DisableOtherMonitors success disabledCnt=%d]", gDisabledDisplayIdsCnt);
     
+    pthread_mutex_unlock(&gDisabledDisplayLock);
     free(displayIds);
 
     return true;

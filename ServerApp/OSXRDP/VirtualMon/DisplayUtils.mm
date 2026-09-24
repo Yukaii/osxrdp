@@ -95,11 +95,10 @@ bool DisplayUtils::ApplyDisplayEnabled(uint32_t* displayIds, int displayCnt, boo
         return false;
     }
 
-    bool configured = true;
+    bool configured = false;
     for (int i = 0; i < displayCnt; i++) {
-        if (CGSConfigureDisplayEnabled(cfg, displayIds[i], enabled) != kCGErrorSuccess) {
-            configured = false;
-            break;
+        if (CGSConfigureDisplayEnabled(cfg, displayIds[i], enabled) == kCGErrorSuccess) {
+            configured = true;
         }
     }
 
