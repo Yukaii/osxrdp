@@ -6,8 +6,63 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <AVFAudio/AVFAudio.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreAudio/CoreAudio.h>
+#import <CoreAudio/CATapDescription.h>
+#import <CoreAudio/AudioHardwareTapping.h>
+
+#include <dlfcn.h>
+#include <unistd.h>
 
 typedef void (*on_audio_data)(const void* pcm, int pcmLen, void* userData);
+
+// 시스템 오디오 녹음 (process tap) 권한 상태. 공개 API 가 없어 TCC SPI 를 사용 (없으면 UNKNOWN)
+enum AudioCapturePermission {
+    AUDIO_CAPTURE_PERMISSION_GRANTED = 0,
+    AUDIO_CAPTURE_PERMISSION_DENIED = 1,
+    AUDIO_CAPTURE_PERMISSION_UNKNOWN = 2,
+};
+
+typedef int (*TCCAccessPreflightFn)(CFStringRef service, CFDictionaryRef options);
+typedef void (*TCCAccessRequestFn)(CFStringRef service, CFDictionaryRef options, void (^callback)(Boolean granted));
+
+static CFStringRef const kTCCServiceAudioCapture = CFSTR("kTCCServiceAudioCapture");
+
+static void* GetTCCSymbol(const char* name) {
+    static void* tcc = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW);
+    });
+
+    return tcc != NULL ? dlsym(tcc, name) : NULL;
+}
+
+static int GetAudioCapturePermission(void) {
+    TCCAccessPreflightFn preflight = (TCCAccessPreflightFn)GetTCCSymbol("TCCAccessPreflight");
+    if (preflight == NULL) {
+        return AUDIO_CAPTURE_PERMISSION_UNKNOWN;
+    }
+
+    int result = preflight(kTCCServiceAudioCapture, NULL);
+    if (result == AUDIO_CAPTURE_PERMISSION_GRANTED || result == AUDIO_CAPTURE_PERMISSION_DENIED) {
+        return result;
+    }
+
+    return AUDIO_CAPTURE_PERMISSION_UNKNOWN;
+}
+
+static bool RequestAudioCapturePermission(void (^callback)(bool granted)) {
+    TCCAccessRequestFn request = (TCCAccessRequestFn)GetTCCSymbol("TCCAccessRequest");
+    if (request == NULL) {
+        return false;
+    }
+
+    request(kTCCServiceAudioCapture, NULL, ^(Boolean granted) {
+        callback(granted != 0);
+    });
+
+    return true;
+}
 
 // ScreenCaptureKit 에서 지원하는 캡처 포맷 (이후 AVAudioConverter 로 클라이언트 포맷 변환)
 static const int CAPTURE_SAMPLE_RATE = 48000;
@@ -41,6 +96,14 @@ API_AVAILABLE(macos(13.0))
 @implementation AudioCaptureImpl {
     SCStream* _stream;
     dispatch_queue_t _audioQue;
+
+    // process tap (macOS 14.2+): 캡처한 소리를 로컬 스피커에서는 음소거
+    AudioObjectID _tapId;
+    AudioObjectID _aggregateId;
+    AudioDeviceIOProcID _ioProcId;
+    AVAudioFormat* _tapFormat;
+    BOOL _defaultOutputListening;
+    AudioObjectPropertyListenerBlock _defaultOutputListenerBlock;
 
     AVAudioFormat* _outputFormat;
     AVAudioConverter* _converter;
@@ -171,6 +234,34 @@ API_AVAILABLE(macos(13.0))
         return NO;
     }
 
+    // process tap 은 캡처한 소리를 로컬에서 음소거할 수 있으므로 우선 사용 (원격 컴퓨터에서만 재생)
+    if (@available(macOS 14.2, *)) {
+        int permission = GetAudioCapturePermission();
+        if (permission == AUDIO_CAPTURE_PERMISSION_GRANTED) {
+            if ([self startTap]) {
+                return YES;
+            }
+        }
+        else if (permission == AUDIO_CAPTURE_PERMISSION_UNKNOWN) {
+            // 권한 요청 후 허용되면 tap 으로 전환. 그 전까지는 ScreenCaptureKit 으로 캡처 (로컬에서도 재생됨)
+            __weak AudioCaptureImpl* weakSelf = self;
+            RequestAudioCapturePermission(^(bool granted) {
+                if (granted) {
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        [weakSelf switchToTap];
+                    });
+                }
+            });
+        }
+        else {
+            NSLog(@"[AudioCaptureImpl::start] system audio recording permission denied. audio also plays on this Mac");
+        }
+    }
+
+    return [self startScreenCaptureAudio];
+}
+
+- (BOOL)startScreenCaptureAudio {
     SCDisplay* display = [self getCaptureDisplay];
     if (display == nil) {
         NSLog(@"[AudioCaptureImpl::start] no display to attach audio capture");
@@ -205,7 +296,7 @@ API_AVAILABLE(macos(13.0))
 
     // stop 과 경합하지 않도록 lock 안에서 시작 (startCapture 는 비동기이므로 lock 을 오래 잡지 않음)
     @synchronized (self) {
-        if (_stopped) {
+        if (_stopped || _tapId != kAudioObjectUnknown) {
             return NO;
         }
         _stream = stream;
@@ -217,9 +308,277 @@ API_AVAILABLE(macos(13.0))
         }];
     }
 
-    NSLog(@"[AudioCaptureImpl::start] audio capture started (%d Hz, %u ch)", (int)_outputFormat.sampleRate, (unsigned)_outputFormat.channelCount);
+    NSLog(@"[AudioCaptureImpl::start] audio capture started with ScreenCaptureKit (%d Hz, %u ch)", (int)_outputFormat.sampleRate, (unsigned)_outputFormat.channelCount);
 
     return YES;
+}
+
+- (void)stopScreenCaptureStream:(SCStream*)stream {
+    if (stream == nil) {
+        return;
+    }
+
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    [stream stopCaptureWithCompletionHandler:^(NSError* _Nullable err) {
+        dispatch_semaphore_signal(sema);
+    }];
+    dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, STOP_TIMEOUT_NS));
+
+    [stream removeStreamOutput:self type:SCStreamOutputTypeAudio error:nil];
+    [stream removeStreamOutput:self type:SCStreamOutputTypeScreen error:nil];
+}
+
+// 세션 중 권한이 허용된 경우 ScreenCaptureKit 캡처를 tap 으로 교체
+- (void)switchToTap API_AVAILABLE(macos(14.2)) {
+    SCStream* stream = nil;
+
+    @synchronized (self) {
+        if (_stopped || _tapId != kAudioObjectUnknown) {
+            return;
+        }
+        stream = _stream;
+        _stream = nil;
+    }
+
+    [self stopScreenCaptureStream:stream];
+
+    if ([self startTap] == NO) {
+        [self startScreenCaptureAudio];
+    }
+}
+
+- (BOOL)startTap API_AVAILABLE(macos(14.2)) {
+    @synchronized (self) {
+        if (_stopped || _tapId != kAudioObjectUnknown) {
+            return NO;
+        }
+
+        if ([self createTapLocked] == NO) {
+            [self destroyTapLocked];
+            return NO;
+        }
+
+        [self addDefaultOutputListenerLocked];
+    }
+
+    NSLog(@"[AudioCaptureImpl::start] audio capture started with process tap (%d Hz, %u ch). local playback is muted",
+          (int)_outputFormat.sampleRate, (unsigned)_outputFormat.channelCount);
+
+    return YES;
+}
+
+- (BOOL)createTapLocked API_AVAILABLE(macos(14.2)) {
+    // agent 자신의 소리 (가상 마이크 재생 등) 는 캡처/음소거 대상에서 제외
+    NSArray<NSNumber*>* excludes = @[];
+    AudioObjectID selfObject = [self processObjectForPid:getpid()];
+    if (selfObject != kAudioObjectUnknown) {
+        excludes = @[@(selfObject)];
+    }
+
+    CATapDescription* desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:excludes];
+    desc.name = @"OSXRDP audio redirection";
+    desc.privateTap = YES;
+    // tap 을 읽는 동안에만 음소거 (agent 가 비정상 종료되어도 로컬 소리가 계속 꺼져 있지 않음)
+    desc.muteBehavior = CATapMutedWhenTapped;
+
+    OSStatus status = AudioHardwareCreateProcessTap(desc, &_tapId);
+    if (status != noErr) {
+        NSLog(@"[AudioCaptureImpl::createTap] AudioHardwareCreateProcessTap failed %d", (int)status);
+        _tapId = kAudioObjectUnknown;
+        return NO;
+    }
+
+    AudioStreamBasicDescription asbd;
+    UInt32 size = sizeof(asbd);
+    AudioObjectPropertyAddress formatAddr = { kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    status = AudioObjectGetPropertyData(_tapId, &formatAddr, 0, NULL, &size, &asbd);
+    if (status != noErr) {
+        NSLog(@"[AudioCaptureImpl::createTap] could not get tap format %d", (int)status);
+        return NO;
+    }
+
+    _tapFormat = [[AVAudioFormat alloc] initWithStreamDescription:&asbd];
+    UInt32 tapBufferCount = _tapFormat.isInterleaved ? 1 : _tapFormat.channelCount;
+    if (_tapFormat == nil || tapBufferCount == 0 || tapBufferCount > 2) {
+        NSLog(@"[AudioCaptureImpl::createTap] unsupported tap format");
+        return NO;
+    }
+
+    // tap 을 읽기 위한 private aggregate device (clock 은 현재 출력 장치 기준)
+    NSMutableDictionary* aggregateDesc = [@{
+        @kAudioAggregateDeviceNameKey: @"OSXRDP Audio Redirection",
+        @kAudioAggregateDeviceUIDKey: [[NSUUID UUID] UUIDString],
+        @kAudioAggregateDeviceIsPrivateKey: @YES,
+        @kAudioAggregateDeviceIsStackedKey: @NO,
+        @kAudioAggregateDeviceTapAutoStartKey: @YES,
+        @kAudioAggregateDeviceTapListKey: @[@{
+            @kAudioSubTapUIDKey: desc.UUID.UUIDString,
+            @kAudioSubTapDriftCompensationKey: @YES,
+        }],
+    } mutableCopy];
+
+    NSString* outputUID = [self defaultOutputDeviceUID];
+    if (outputUID != nil) {
+        aggregateDesc[@kAudioAggregateDeviceMainSubDeviceKey] = outputUID;
+        aggregateDesc[@kAudioAggregateDeviceSubDeviceListKey] = @[@{ @kAudioSubDeviceUIDKey: outputUID }];
+    }
+
+    status = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)aggregateDesc, &_aggregateId);
+    if (status != noErr) {
+        NSLog(@"[AudioCaptureImpl::createTap] AudioHardwareCreateAggregateDevice failed %d", (int)status);
+        _aggregateId = kAudioObjectUnknown;
+        return NO;
+    }
+
+    AVAudioFormat* tapFormat = _tapFormat;
+    __weak AudioCaptureImpl* weakSelf = self;
+    status = AudioDeviceCreateIOProcIDWithBlock(&_ioProcId, _aggregateId, _audioQue,
+        ^(const AudioTimeStamp* inNow, const AudioBufferList* inInputData, const AudioTimeStamp* inInputTime,
+          AudioBufferList* outOutputData, const AudioTimeStamp* inOutputTime) {
+        AudioCaptureImpl* strongSelf = weakSelf;
+        if (strongSelf == nil || strongSelf->_stopped || inInputData == NULL || inInputData->mNumberBuffers < tapBufferCount) {
+            return;
+        }
+
+        // aggregate 의 입력 buffer 는 sub device 입력 뒤에 tap 이 위치
+        struct {
+            UInt32 mNumberBuffers;
+            AudioBuffer mBuffers[2];
+        } tapBuffers;
+        tapBuffers.mNumberBuffers = tapBufferCount;
+        for (UInt32 i = 0; i < tapBufferCount; i++) {
+            tapBuffers.mBuffers[i] = inInputData->mBuffers[inInputData->mNumberBuffers - tapBufferCount + i];
+        }
+
+        AVAudioPCMBuffer* input = [[AVAudioPCMBuffer alloc] initWithPCMFormat:tapFormat
+                                                             bufferListNoCopy:(const AudioBufferList*)&tapBuffers
+                                                                  deallocator:nil];
+        if (input == nil || input.frameLength == 0 || [strongSelf prepareConverterForFormat:tapFormat] == NO) {
+            return;
+        }
+
+        [strongSelf processInput:input];
+    });
+    if (status != noErr) {
+        NSLog(@"[AudioCaptureImpl::createTap] AudioDeviceCreateIOProcIDWithBlock failed %d", (int)status);
+        _ioProcId = NULL;
+        return NO;
+    }
+
+    status = AudioDeviceStart(_aggregateId, _ioProcId);
+    if (status != noErr) {
+        NSLog(@"[AudioCaptureImpl::createTap] AudioDeviceStart failed %d", (int)status);
+        return NO;
+    }
+
+    return YES;
+}
+
+- (void)destroyTapLocked API_AVAILABLE(macos(14.2)) {
+    if (_aggregateId != kAudioObjectUnknown) {
+        if (_ioProcId != NULL) {
+            AudioDeviceStop(_aggregateId, _ioProcId);
+            AudioDeviceDestroyIOProcID(_aggregateId, _ioProcId);
+            _ioProcId = NULL;
+        }
+
+        AudioHardwareDestroyAggregateDevice(_aggregateId);
+        _aggregateId = kAudioObjectUnknown;
+    }
+
+    if (_tapId != kAudioObjectUnknown) {
+        AudioHardwareDestroyProcessTap(_tapId);
+        _tapId = kAudioObjectUnknown;
+    }
+
+    _tapFormat = nil;
+}
+
+// 출력 장치가 바뀌면 (이어폰 연결/해제 등) aggregate device 의 clock 장치가 사라질 수 있으므로 tap 을 다시 생성
+- (void)addDefaultOutputListenerLocked API_AVAILABLE(macos(14.2)) {
+    if (_defaultOutputListening) {
+        return;
+    }
+
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &addr, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), [self defaultOutputListener]) == noErr) {
+        _defaultOutputListening = YES;
+    }
+}
+
+- (void)removeDefaultOutputListener API_AVAILABLE(macos(14.2)) {
+    @synchronized (self) {
+        if (_defaultOutputListening == NO) {
+            return;
+        }
+        _defaultOutputListening = NO;
+    }
+
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &addr, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), [self defaultOutputListener]);
+}
+
+- (AudioObjectPropertyListenerBlock)defaultOutputListener API_AVAILABLE(macos(14.2)) {
+    // add/remove 에 같은 block 을 전달해야 하므로 한번만 생성
+    if (_defaultOutputListenerBlock == nil) {
+        __weak AudioCaptureImpl* weakSelf = self;
+        _defaultOutputListenerBlock = ^(UInt32 inNumberAddresses, const AudioObjectPropertyAddress* inAddresses) {
+            [weakSelf recreateTap];
+        };
+    }
+
+    return _defaultOutputListenerBlock;
+}
+
+- (void)recreateTap API_AVAILABLE(macos(14.2)) {
+    bool fallback = false;
+
+    @synchronized (self) {
+        if (_stopped || _tapId == kAudioObjectUnknown) {
+            return;
+        }
+
+        [self destroyTapLocked];
+        if ([self createTapLocked] == NO) {
+            [self destroyTapLocked];
+            fallback = true;
+        }
+    }
+
+    if (fallback) {
+        NSLog(@"[AudioCaptureImpl::recreateTap] could not recreate process tap. fall back to ScreenCaptureKit");
+        [self startScreenCaptureAudio];
+    }
+}
+
+- (AudioObjectID)processObjectForPid:(pid_t)pid {
+    AudioObjectID object = kAudioObjectUnknown;
+    UInt32 size = sizeof(object);
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, sizeof(pid), &pid, &size, &object) != noErr) {
+        return kAudioObjectUnknown;
+    }
+
+    return object;
+}
+
+- (NSString*)defaultOutputDeviceUID {
+    AudioObjectID device = kAudioObjectUnknown;
+    UInt32 size = sizeof(device);
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &device) != noErr || device == kAudioObjectUnknown) {
+        return nil;
+    }
+
+    CFStringRef uid = NULL;
+    size = sizeof(uid);
+    addr.mSelector = kAudioDevicePropertyDeviceUID;
+    if (AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, &uid) != noErr || uid == NULL) {
+        return nil;
+    }
+
+    return (__bridge_transfer NSString*)uid;
 }
 
 - (void)stop {
@@ -229,18 +588,18 @@ API_AVAILABLE(macos(13.0))
         _stopped = YES;
         stream = _stream;
         _stream = nil;
+
+        if (@available(macOS 14.2, *)) {
+            [self destroyTapLocked];
+        }
     }
 
-    if (stream != nil) {
-        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-        [stream stopCaptureWithCompletionHandler:^(NSError* _Nullable err) {
-            dispatch_semaphore_signal(sema);
-        }];
-        dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, STOP_TIMEOUT_NS));
-
-        [stream removeStreamOutput:self type:SCStreamOutputTypeAudio error:nil];
-        [stream removeStreamOutput:self type:SCStreamOutputTypeScreen error:nil];
+    // listener 제거는 lock 밖에서 수행 (진행 중인 listener 콜백이 lock 을 기다리는 경우 교착 방지)
+    if (@available(macOS 14.2, *)) {
+        [self removeDefaultOutputListener];
     }
+
+    [self stopScreenCaptureStream:stream];
 
     // 처리중인 콜백이 끝날때까지 대기 (이후 상위 객체의 ipc 를 사용하지 않도록)
     dispatch_sync(_audioQue, ^{});
@@ -270,10 +629,7 @@ API_AVAILABLE(macos(13.0))
     if (_converter == nil || _converterInputFormat.sampleRate != asbd->mSampleRate ||
         _converterInputFormat.channelCount != asbd->mChannelsPerFrame ||
         _converterInputFormat.streamDescription->mFormatFlags != asbd->mFormatFlags) {
-        _converterInputFormat = [[AVAudioFormat alloc] initWithStreamDescription:asbd];
-        _converter = [[AVAudioConverter alloc] initFromFormat:_converterInputFormat toFormat:_outputFormat];
-        if (_converter == nil) {
-            NSLog(@"[AudioCaptureImpl] could not create converter");
+        if ([self prepareConverterForFormat:[[AVAudioFormat alloc] initWithStreamDescription:asbd]] == NO) {
             return;
         }
     }
@@ -288,6 +644,27 @@ API_AVAILABLE(macos(13.0))
         return;
     }
 
+    [self processInput:inputBuffer];
+}
+
+- (BOOL)prepareConverterForFormat:(AVAudioFormat*)format {
+    if (_converter != nil && [_converterInputFormat isEqual:format]) {
+        return YES;
+    }
+
+    _converterInputFormat = format;
+    _converter = format != nil ? [[AVAudioConverter alloc] initFromFormat:format toFormat:_outputFormat] : nil;
+    if (_converter == nil) {
+        NSLog(@"[AudioCaptureImpl] could not create converter");
+        return NO;
+    }
+
+    return YES;
+}
+
+// 캡처한 오디오를 클라이언트 포맷으로 변환하여 전달 (_audioQue 에서 호출)
+- (void)processInput:(AVAudioPCMBuffer*)inputBuffer {
+    AVAudioFrameCount frameCount = inputBuffer.frameLength;
     AVAudioFrameCount outputCapacity = (AVAudioFrameCount)((double)frameCount * _outputFormat.sampleRate / _converterInputFormat.sampleRate) + 64;
     AVAudioPCMBuffer* outputBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:_outputFormat frameCapacity:outputCapacity];
     if (outputBuffer == nil) {
@@ -360,7 +737,7 @@ API_AVAILABLE(macos(13.0))
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, RESTART_DELAY_NS), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (self->_stopped == NO) {
-            [self start];
+            [self startScreenCaptureAudio];
         }
     });
 }
