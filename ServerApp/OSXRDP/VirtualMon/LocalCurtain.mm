@@ -15,8 +15,11 @@ static CFMachPortRef gInputTap = NULL;
 static CFRunLoopRef gInputTapRunLoop = NULL;
 static pthread_t gInputTapThread;
 static bool gInputTapThreadStarted = false;
+static bool gCurtainThreadStop = false;
 
 static const uint32_t kMaxDisplays = 32;
+
+static NSString* const kMirrorToLocalDisplayKey = @"MirrorSessionToLocalDisplay";
 
 // 물리 디스플레이 (OSXRDP 가상 모니터가 아닌 모든 디스플레이) 를 검게 표시
 static void ApplyBlackoutLocked() {
@@ -72,42 +75,114 @@ static CGEventRef InputTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return NULL;
 }
 
-static void* InputTapThreadProc(void* args) {
-    dispatch_semaphore_t ready = (__bridge dispatch_semaphore_t)args;
+// macOS 가 gamma 를 다시 설정하는 경우 (Night Shift, True Tone, 디스플레이 깨어남 등) 가 있으므로 주기적으로 확인
+static const CFTimeInterval kBlackoutCheckInterval = 0.25;
 
-    pthread_setname_np("osxrdp.localcurtain.input");
+static bool IsBlackedOut(CGDirectDisplayID displayId) {
+    CGGammaValue red[256];
+    CGGammaValue green[256];
+    CGGammaValue blue[256];
+    uint32_t sampleCnt = 0;
+
+    if (CGGetDisplayTransferByTable(displayId, 256, red, green, blue, &sampleCnt) != kCGErrorSuccess || sampleCnt == 0) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < sampleCnt; i++) {
+        if (red[i] > 0.001f || green[i] > 0.001f || blue[i] > 0.001f) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void BlackoutCheckTimerCallback(CFRunLoopTimerRef timer, void* info) {
+    (void)timer;
+    (void)info;
+
+    pthread_mutex_lock(&gCurtainLock);
+
+    if (gCurtainRefCount > 0) {
+        CGDirectDisplayID displayIds[kMaxDisplays];
+        uint32_t displayCnt = 0;
+        if (CGGetOnlineDisplayList(kMaxDisplays, displayIds, &displayCnt) == kCGErrorSuccess) {
+            for (uint32_t i = 0; i < displayCnt; i++) {
+                if (DisplayUtils::IsOsxrdpVirtualDisplay(displayIds[i]) || IsBlackedOut(displayIds[i])) {
+                    continue;
+                }
+
+                NSLog(@"[LocalCurtain] display %u was restored by the system. black it out again", displayIds[i]);
+                CGSetDisplayTransferByFormula(displayIds[i], 0, 0, 1, 0, 0, 1, 0, 0, 1);
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&gCurtainLock);
+}
+
+static void* CurtainThreadProc(void* args) {
+    dispatch_semaphore_t ready = (__bridge_transfer dispatch_semaphore_t)args;
+
+    pthread_setname_np("osxrdp.localcurtain");
+
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
 
     CFMachPortRef tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
                                          kCGEventMaskForAllEvents, InputTapCallback, NULL);
-    if (tap == NULL) {
+    CFRunLoopSourceRef source = NULL;
+    if (tap != NULL) {
+        source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+        CFRunLoopAddSource(runLoop, source, kCFRunLoopCommonModes);
+    }
+    else {
         NSLog(@"[LocalCurtain] could not create input event tap. local input is not blocked");
-        dispatch_semaphore_signal(ready);
-        return NULL;
     }
 
-    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
-    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
-    CFRunLoopAddSource(runLoop, source, kCFRunLoopCommonModes);
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + kBlackoutCheckInterval,
+                                                   kBlackoutCheckInterval, 0, 0, BlackoutCheckTimerCallback, NULL);
+    if (timer != NULL) {
+        CFRunLoopAddTimer(runLoop, timer, kCFRunLoopCommonModes);
+    }
 
     pthread_mutex_lock(&gCurtainLock);
     gInputTap = tap;
     gInputTapRunLoop = (CFRunLoopRef)CFRetain(runLoop);
     pthread_mutex_unlock(&gCurtainLock);
 
-    CGEventTapEnable(tap, true);
+    if (tap != NULL) {
+        CGEventTapEnable(tap, true);
+    }
     dispatch_semaphore_signal(ready);
 
-    CFRunLoopRun();
+    // Stop 이 run loop 진입 전에 호출되어도 멈출 수 있도록 stop 플래그를 주기적으로 확인
+    for (;;) {
+        pthread_mutex_lock(&gCurtainLock);
+        bool stop = gCurtainThreadStop;
+        pthread_mutex_unlock(&gCurtainLock);
+        if (stop) {
+            break;
+        }
+
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+    }
 
     pthread_mutex_lock(&gCurtainLock);
     gInputTap = NULL;
     pthread_mutex_unlock(&gCurtainLock);
 
-    CGEventTapEnable(tap, false);
-    CFRunLoopRemoveSource(runLoop, source, kCFRunLoopCommonModes);
-    CFRelease(source);
-    CFMachPortInvalidate(tap);
-    CFRelease(tap);
+    if (timer != NULL) {
+        CFRunLoopTimerInvalidate(timer);
+        CFRelease(timer);
+    }
+
+    if (tap != NULL) {
+        CGEventTapEnable(tap, false);
+        CFRunLoopRemoveSource(runLoop, source, kCFRunLoopCommonModes);
+        CFRelease(source);
+        CFMachPortInvalidate(tap);
+        CFRelease(tap);
+    }
 
     return NULL;
 }
@@ -115,13 +190,20 @@ static void* InputTapThreadProc(void* args) {
 static void StartInputBlock() {
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
 
-    if (pthread_create(&gInputTapThread, NULL, InputTapThreadProc, (__bridge void*)ready) != 0) {
-        NSLog(@"[LocalCurtain] could not start input tap thread");
+    pthread_mutex_lock(&gCurtainLock);
+    gCurtainThreadStop = false;
+    pthread_mutex_unlock(&gCurtainLock);
+
+    // 스레드가 semaphore 를 소유 (대기 시간이 초과되어도 해제된 객체에 signal 하지 않도록)
+    void* threadArg = (__bridge_retained void*)ready;
+    if (pthread_create(&gInputTapThread, NULL, CurtainThreadProc, threadArg) != 0) {
+        CFRelease(threadArg);
+        NSLog(@"[LocalCurtain] could not start curtain thread");
         return;
     }
     gInputTapThreadStarted = true;
 
-    // tap 생성이 끝날때까지 대기 (Stop 이 run loop 를 확실히 멈출 수 있도록)
+    // run loop 준비가 끝날때까지 대기 (Stop 이 run loop 를 확실히 멈출 수 있도록)
     dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
 }
 
@@ -131,6 +213,7 @@ static void StopInputBlock() {
     }
 
     pthread_mutex_lock(&gCurtainLock);
+    gCurtainThreadStop = true;
     CFRunLoopRef runLoop = gInputTapRunLoop;
     gInputTapRunLoop = NULL;
     pthread_mutex_unlock(&gCurtainLock);
@@ -196,4 +279,12 @@ void LocalCurtain::Refresh() {
         ApplyBlackoutLocked();
     }
     pthread_mutex_unlock(&gCurtainLock);
+}
+
+bool LocalCurtain::IsMirrorToLocalDisplayEnabled() {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kMirrorToLocalDisplayKey] == YES;
+}
+
+void LocalCurtain::SetMirrorToLocalDisplayEnabled(bool enabled) {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled ? YES : NO forKey:kMirrorToLocalDisplayKey];
 }

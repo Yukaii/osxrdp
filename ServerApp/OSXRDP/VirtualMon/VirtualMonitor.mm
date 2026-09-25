@@ -187,8 +187,8 @@ void VirtualMonitor::StartMonitor() {
     HoldDisplaySleepAssertion();
     WakeupDisplay();
 
-    // 원격 세션 동안 로컬 화면을 가리고 로컬 입력을 차단
-    if (_curtainHeld == false) {
+    // 원격 세션 동안 로컬 화면을 가리고 로컬 입력을 차단 (사용자가 미러링을 선택한 경우 제외)
+    if (_curtainHeld == false && LocalCurtain::IsMirrorToLocalDisplayEnabled() == false) {
         LocalCurtain::Acquire();
         _curtainHeld = true;
     }

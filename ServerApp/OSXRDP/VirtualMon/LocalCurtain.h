@@ -13,6 +13,11 @@ public:
 
     // 디스플레이 구성이 바뀐 경우 (새 모니터 연결, 미러링 변경 등) 다시 적용
     static void Refresh();
+
+    // 사용자 설정: 원격 세션을 이 Mac 의 화면에도 표시 (true 이면 화면을 가리지 않고 로컬 입력도 허용)
+    // 다음 원격 세션부터 적용
+    static bool IsMirrorToLocalDisplayEnabled();
+    static void SetMirrorToLocalDisplayEnabled(bool enabled);
 };
 
 #endif /* LocalCurtain_h */

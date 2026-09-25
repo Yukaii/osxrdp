@@ -3,6 +3,7 @@
 #include "../../RemoteConnection/RemoteConnectionService.h"
 #include "../../Startup/StartupManager.h"
 #include "../../Utils/PermissionCheckUtils.h"
+#include "../../VirtualMon/LocalCurtain.h"
 
 #import "../PermissionSettingsWindow.h"
 
@@ -13,6 +14,7 @@
 @property (strong) IBOutlet NSButton* startRemoteConnectionBtn;
 @property (strong) IBOutlet NSTextField* startupLabel;
 @property (strong) IBOutlet NSSwitch* startupSwitch;
+@property (strong) IBOutlet NSSwitch* mirrorLocalDisplaySwitch;
 @property (assign) BOOL didConfigureInitialState;
 
 @end
@@ -38,8 +40,14 @@
         self.startupSwitch.hidden = YES;
     }
 
+    [self.mirrorLocalDisplaySwitch setState:LocalCurtain::IsMirrorToLocalDisplayEnabled() ? NSControlStateValueOn : NSControlStateValueOff];
+
     [self setDisabledBtnStyle:self.startRemoteConnectionBtn];
     [self startRemoteConnectionServer:YES];
+}
+
+- (IBAction)onMirrorLocalDisplayChanged:(id)sender {
+    LocalCurtain::SetMirrorToLocalDisplayEnabled(self.mirrorLocalDisplaySwitch.state == NSControlStateValueOn);
 }
 
 - (IBAction)openPermissionWindowBtnClicked:(id)sender {

@@ -30,6 +30,7 @@
                 <outlet property="startRemoteConnectionBtn" destination="R0M-Dk-LTD" id="x7D-XQ-4Ue"/>
                 <outlet property="startupLabel" destination="Umh-VF-aFj" id="Q8q-Wd-4kW"/>
                 <outlet property="startupSwitch" destination="hT6-xE-TQj" id="Hh6-Wp-8cT"/>
+                <outlet property="mirrorLocalDisplaySwitch" destination="Kq7-Mr-S1c" id="Kq7-Mr-O1d"/>
                 <outlet property="view" destination="EiT-Mj-1SZ" id="dU4-5D-Zm7"/>
             </connections>
         </customObject>
@@ -396,6 +397,22 @@
                                                 <color key="backgroundColor" name="textBackgroundColor" catalog="System" colorSpace="catalog"/>
                                             </textFieldCell>
                                         </textField>
+                                        <textField focusRingType="none" horizontalHuggingPriority="251" verticalHuggingPriority="750" fixedFrame="YES" translatesAutoresizingMaskIntoConstraints="NO" id="Kq7-Mr-L1a" userLabel="MirrorLocalDisplayLabel">
+                                            <rect key="frame" x="15" y="135" width="300" height="16"/>
+                                            <autoresizingMask key="autoresizingMask" flexibleMaxX="YES" flexibleMinY="YES"/>
+                                            <textFieldCell key="cell" lineBreakMode="clipping" title="Mirror session to this Mac's display" id="Kq7-Mr-C1b">
+                                                <font key="font" metaFont="system"/>
+                                                <color key="textColor" name="labelColor" catalog="System" colorSpace="catalog"/>
+                                                <color key="backgroundColor" name="textBackgroundColor" catalog="System" colorSpace="catalog"/>
+                                            </textFieldCell>
+                                        </textField>
+                                        <switch horizontalHuggingPriority="750" verticalHuggingPriority="750" fixedFrame="YES" baseWritingDirection="leftToRight" alignment="left" translatesAutoresizingMaskIntoConstraints="NO" id="Kq7-Mr-S1c">
+                                            <rect key="frame" x="414" y="131" width="54" height="24"/>
+                                            <autoresizingMask key="autoresizingMask" flexibleMinX="YES" flexibleMinY="YES"/>
+                                            <connections>
+                                                <action selector="onMirrorLocalDisplayChanged:" target="c2a-Xj-7nZ" id="Kq7-Mr-A1f"/>
+                                            </connections>
+                                        </switch>
                                         <switch horizontalHuggingPriority="750" verticalHuggingPriority="750" fixedFrame="YES" baseWritingDirection="leftToRight" alignment="left" translatesAutoresizingMaskIntoConstraints="NO" id="hT6-xE-TQj">
                                             <rect key="frame" x="414" y="175" width="54" height="24"/>
                                             <autoresizingMask key="autoresizingMask" flexibleMinX="YES" flexibleMinY="YES"/>
