@@ -20,9 +20,9 @@ private:
     xipc_t* _client;
     int _frameBytes;
 
-    void Start(xipc_t* client, int sampleRate, int channels, int bitsPerSample);
+    void Start(xipc_t* client, int sampleRate, int channels, int bitsPerSample, int codec);
 
-    // 캡처된 PCM 을 ipc 버퍼 크기에 맞춰 분할 전송
+    // 캡처된 PCM 을 ipc 버퍼 크기에 맞춰 분할 전송 (AAC frame 은 버퍼보다 훨씬 작아 분할되지 않음)
     static void OnAudioData(const void* pcm, int pcmLen, void* userData);
 };
 

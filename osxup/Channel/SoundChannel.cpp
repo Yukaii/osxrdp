@@ -28,17 +28,24 @@ static const int MAX_UNCONFIRMED_MS = 600;
 // confirm 이 이 시간동안 오지 않으면 (confirm 을 보내지 않는 클라이언트) 흐름 제어를 초기화
 static const uint64_t CONFIRM_TIMEOUT_MS = 3000;
 
-struct PcmFormat {
+// AAC-LC frame 당 sample 수
+static const int AAC_SAMPLES_PER_FRAME = 1024;
+
+struct ServerFormat {
+    uint16_t formatTag;
     int sampleRate;
     int channels;
     int bitsPerSample;
+    int avgBytesPerSec;
 };
 
-// 서버가 제공하는 포맷 (agent 에서 해당 포맷으로 변환하여 전달)
-static const PcmFormat kServerFormats[] = {
-    { 48000, 2, 16 },
-    { 44100, 2, 16 },
-    { 22050, 2, 16 },
+// 서버가 제공하는 포맷 (agent 에서 해당 포맷으로 변환 / 인코딩하여 전달)
+// AAC 는 xrdp chansrv 와 동일한 형식 (AAC-LC raw frame, 44.1kHz stereo)
+static const ServerFormat kServerFormats[] = {
+    { WAVE_FORMAT_AAC, 44100, 2, 16, 12000 },
+    { WAVE_FORMAT_PCM, 48000, 2, 16, 48000 * 4 },
+    { WAVE_FORMAT_PCM, 44100, 2, 16, 44100 * 4 },
+    { WAVE_FORMAT_PCM, 22050, 2, 16, 22050 * 4 },
 };
 
 static const int kNumServerFormats = (int)(sizeof(kServerFormats) / sizeof(kServerFormats[0]));
@@ -116,17 +123,19 @@ SoundChannel::SoundChannel() :
     _incomingTotalLen(0),
     _clientVersion(0),
     _clientFormatNo(-1),
+    _allowAac(true),
+    _codec(OSXRDP_AUDIO_CODEC_PCM),
     _sampleRate(0),
     _channels(0),
     _bitsPerSample(0),
     _bytesPerSec(0),
     _blockNo(0),
     _lastConfirmedBlockNo(0xff),
-    _unconfirmedBytes(0),
+    _unconfirmedUs(0),
     _lastConfirmTimeMs(0),
     _audioStartTimeMs(0)
 {
-    memset(_blockBytes, 0, sizeof(_blockBytes));
+    memset(_blockDurationUs, 0, sizeof(_blockDurationUs));
 }
 
 SoundChannel::~SoundChannel() {
@@ -139,6 +148,7 @@ bool SoundChannel::Initialize(const struct mod* mod) {
     Release();
 
     _mod = mod;
+    _allowAac = mod->audioAllowAac != 0;
 
     // 클라이언트가 오디오 재생을 원하지 않을 경우 rdpsnd 채널 자체가 없음
     _channelId = mod->server_get_channel_id((struct mod*)mod, RDPSND_SVC_CHANNEL_NAME);
@@ -161,14 +171,15 @@ void SoundChannel::Release() {
     _formatsSent = false;
     _clientVersion = 0;
     _clientFormatNo = -1;
+    _codec = OSXRDP_AUDIO_CODEC_PCM;
     _sampleRate = 0;
     _channels = 0;
     _bitsPerSample = 0;
     _bytesPerSec = 0;
     _blockNo = 0;
     _lastConfirmedBlockNo = 0xff;
-    memset(_blockBytes, 0, sizeof(_blockBytes));
-    _unconfirmedBytes = 0;
+    memset(_blockDurationUs, 0, sizeof(_blockDurationUs));
+    _unconfirmedUs = 0;
     _lastConfirmTimeMs = 0;
     _audioStartTimeMs = 0;
 }
@@ -195,13 +206,13 @@ void SoundChannel::SendServerFormats() {
     w.UInt8(0);                             // bPad
 
     for (int i = 0; i < kNumServerFormats; i++) {
-        const PcmFormat& f = kServerFormats[i];
+        const ServerFormat& f = kServerFormats[i];
         int blockAlign = f.channels * f.bitsPerSample / 8;
 
-        w.UInt16(WAVE_FORMAT_PCM);                      // wFormatTag
+        w.UInt16(f.formatTag);                          // wFormatTag
         w.UInt16((uint16_t)f.channels);                 // nChannels
         w.UInt32((uint32_t)f.sampleRate);               // nSamplesPerSec
-        w.UInt32((uint32_t)(f.sampleRate * blockAlign)); // nAvgBytesPerSec
+        w.UInt32((uint32_t)f.avgBytesPerSec);           // nAvgBytesPerSec
         w.UInt16((uint16_t)blockAlign);                 // nBlockAlign
         w.UInt16((uint16_t)f.bitsPerSample);            // wBitsPerSample
         w.UInt16(0);                                    // cbSize
@@ -258,6 +269,10 @@ bool SoundChannel::IsReady() const {
     return _state == State::READY;
 }
 
+int SoundChannel::GetCodec() const {
+    return _codec;
+}
+
 int SoundChannel::GetSampleRate() const {
     return _sampleRate;
 }
@@ -270,15 +285,25 @@ int SoundChannel::GetBitsPerSample() const {
     return _bitsPerSample;
 }
 
-void SoundChannel::SendAudio(const void* pcm, int pcmLen) {
-    if (_state != State::READY || pcm == NULL || pcmLen <= 0) {
+void SoundChannel::SendAudio(const void* data, int dataLen) {
+    if (_state != State::READY || data == NULL || dataLen <= 0) {
         return;
     }
 
-    // PCM 은 nBlockAlign 단위여야 함
-    int blockAlign = _channels * _bitsPerSample / 8;
-    pcmLen -= pcmLen % blockAlign;
-    if (pcmLen < 4 || pcmLen > OSXRDP_AUDIO_MAX_CHUNK) {
+    int64_t durationUs = 0;
+    if (_codec == OSXRDP_AUDIO_CODEC_AAC) {
+        // AAC 는 frame 1개 단위로 전송
+        durationUs = (int64_t)AAC_SAMPLES_PER_FRAME * 1000000 / _sampleRate;
+    }
+    else {
+        // PCM 은 nBlockAlign 단위여야 함
+        int blockAlign = _channels * _bitsPerSample / 8;
+        dataLen -= dataLen % blockAlign;
+        durationUs = (int64_t)dataLen * 1000000 / _bytesPerSec;
+    }
+
+    // WaveInfo PDU 는 데이터의 처음 4byte 를 포함
+    if (dataLen < 4 || dataLen > OSXRDP_AUDIO_MAX_CHUNK) {
         return;
     }
 
@@ -288,7 +313,7 @@ void SoundChannel::SendAudio(const void* pcm, int pcmLen) {
 
     uint64_t now = _NowMs();
     uint16_t wTimeStamp = (uint16_t)(now & 0xffff);
-    const uint8_t* src = (const uint8_t*)pcm;
+    const uint8_t* src = (const uint8_t*)data;
 
     PduWriter w(_outBuf, sizeof(_outBuf));
 
@@ -302,7 +327,7 @@ void SoundChannel::SendAudio(const void* pcm, int pcmLen) {
         w.UInt8(0);
         w.UInt8(0);
         w.UInt32((uint32_t)(now - _audioStartTimeMs));  // dwAudioTimeStamp
-        w.Data(src, pcmLen);
+        w.Data(src, dataLen);
         w.EndPdu();
 
         if (w.Overflowed()) {
@@ -323,13 +348,13 @@ void SoundChannel::SendAudio(const void* pcm, int pcmLen) {
         w.UInt8(0);
         w.Data(src, 4);                                 // Data[4]
         // BodySize = WaveInfo 이후 필드(8) + 전체 wave 데이터 길이
-        w.SetBodySize((uint16_t)(8 + pcmLen));
+        w.SetBodySize((uint16_t)(8 + dataLen));
 
         _SendPdu(w.buf, w.len);
 
         PduWriter wave(_outBuf, sizeof(_outBuf));
         wave.UInt32(0);                                 // bPad
-        wave.Data(src + 4, pcmLen - 4);
+        wave.Data(src + 4, dataLen - 4);
 
         if (wave.Overflowed()) {
             return;
@@ -338,7 +363,7 @@ void SoundChannel::SendAudio(const void* pcm, int pcmLen) {
         _SendPdu(wave.buf, wave.len);
     }
 
-    _TrackSentBlock(pcmLen);
+    _TrackSentBlock(durationUs);
 }
 
 void SoundChannel::_ProcessPdu(const uint8_t* pdu, int pduLen) {
@@ -407,26 +432,36 @@ void SoundChannel::_ProcessClientFormats(const uint8_t* body, int bodyLen) {
 
         offset += AUDIO_FORMAT_SIZE + cbSize;
 
-        if (formatTag != WAVE_FORMAT_PCM || bitsPerSample != 16) {
+        int codec = OSXRDP_AUDIO_CODEC_PCM;
+        int score = 0;
+
+        if (formatTag == WAVE_FORMAT_AAC) {
+            // 대역폭이 PCM 의 1/16 수준이므로 지원하면 우선 사용 (xrdp.ini: audio_codec=pcm 으로 비활성화)
+            if (_allowAac == false || sampleRate != 44100 || channels != 2) {
+                continue;
+            }
+            codec = OSXRDP_AUDIO_CODEC_AAC;
+            score = 100;
+        }
+        else if (formatTag == WAVE_FORMAT_PCM && bitsPerSample == 16 &&
+                 (channels == 1 || channels == 2) && sampleRate >= 8000 && sampleRate <= 192000) {
+            score = 1;
+            if (sampleRate == 48000) score = 30;
+            else if (sampleRate == 44100) score = 20;
+            else if (sampleRate > 22050) score = 10;
+            if (channels == 2) score += 5;
+        }
+        else {
             continue;
         }
-
-        if ((channels != 1 && channels != 2) || sampleRate < 8000 || sampleRate > 192000) {
-            continue;
-        }
-
-        int score = 1;
-        if (sampleRate == 48000) score = 30;
-        else if (sampleRate == 44100) score = 20;
-        else if (sampleRate > 22050) score = 10;
-        if (channels == 2) score += 5;
 
         if (score > bestScore) {
             bestScore = score;
             bestIndex = i;
+            _codec = codec;
             _sampleRate = sampleRate;
             _channels = channels;
-            _bitsPerSample = bitsPerSample;
+            _bitsPerSample = 16;
         }
     }
 
@@ -439,8 +474,8 @@ void SoundChannel::_ProcessClientFormats(const uint8_t* body, int bodyLen) {
     _clientFormatNo = bestIndex;
     _bytesPerSec = _sampleRate * _channels * _bitsPerSample / 8;
 
-    printf("[SoundChannel] client format #%d (%d Hz, %d ch, %d bit), version %d\n",
-           _clientFormatNo, _sampleRate, _channels, _bitsPerSample, _clientVersion);
+    printf("[SoundChannel] client format #%d (%s %d Hz, %d ch), version %d\n",
+           _clientFormatNo, _codec == OSXRDP_AUDIO_CODEC_AAC ? "AAC" : "PCM", _sampleRate, _channels, _clientVersion);
 
     _SendTraining();
 }
@@ -474,12 +509,12 @@ void SoundChannel::_ProcessWaveConfirm(const uint8_t* body, int bodyLen) {
 
     while (_lastConfirmedBlockNo != confirmed) {
         _lastConfirmedBlockNo++;
-        _unconfirmedBytes -= _blockBytes[_lastConfirmedBlockNo];
-        _blockBytes[_lastConfirmedBlockNo] = 0;
+        _unconfirmedUs -= _blockDurationUs[_lastConfirmedBlockNo];
+        _blockDurationUs[_lastConfirmedBlockNo] = 0;
     }
 
-    if (_unconfirmedBytes < 0) {
-        _unconfirmedBytes = 0;
+    if (_unconfirmedUs < 0) {
+        _unconfirmedUs = 0;
     }
 
     _lastConfirmTimeMs = _NowMs();
@@ -499,19 +534,14 @@ void SoundChannel::_SendTraining() {
 }
 
 bool SoundChannel::_ShouldDropBlock() {
-    if (_bytesPerSec <= 0 || _unconfirmedBytes == 0) {
-        return false;
-    }
-
-    int64_t unconfirmedMs = _unconfirmedBytes * 1000 / _bytesPerSec;
-    if (unconfirmedMs <= MAX_UNCONFIRMED_MS) {
+    if (_unconfirmedUs <= (int64_t)MAX_UNCONFIRMED_MS * 1000) {
         return false;
     }
 
     // confirm 이 오랫동안 오지 않음 -> 흐름 제어 초기화 후 전송 재개
     if (_NowMs() - _lastConfirmTimeMs > CONFIRM_TIMEOUT_MS) {
-        memset(_blockBytes, 0, sizeof(_blockBytes));
-        _unconfirmedBytes = 0;
+        memset(_blockDurationUs, 0, sizeof(_blockDurationUs));
+        _unconfirmedUs = 0;
         _lastConfirmedBlockNo = (uint8_t)(_blockNo - 1);
         _lastConfirmTimeMs = _NowMs();
 
@@ -521,16 +551,16 @@ bool SoundChannel::_ShouldDropBlock() {
     return true;
 }
 
-void SoundChannel::_TrackSentBlock(int pcmLen) {
+void SoundChannel::_TrackSentBlock(int64_t durationUs) {
     // 256 block 을 넘게 확인되지 않으면 block 번호가 겹치므로 가장 오래된 block 을 확인된 것으로 처리
     if (_blockNo == _lastConfirmedBlockNo) {
         _lastConfirmedBlockNo++;
-        _unconfirmedBytes -= _blockBytes[_lastConfirmedBlockNo];
-        _blockBytes[_lastConfirmedBlockNo] = 0;
+        _unconfirmedUs -= _blockDurationUs[_lastConfirmedBlockNo];
+        _blockDurationUs[_lastConfirmedBlockNo] = 0;
     }
 
-    _blockBytes[_blockNo] = pcmLen;
-    _unconfirmedBytes += pcmLen;
+    _blockDurationUs[_blockNo] = durationUs;
+    _unconfirmedUs += durationUs;
     _blockNo++;
 }
 

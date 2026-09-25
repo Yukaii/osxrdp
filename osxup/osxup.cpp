@@ -188,6 +188,9 @@ lib_mod_set_param(struct mod *mod, const char *name, const char *value)
     else if (strcasecmp(name, "client_info") == 0) {
         memcpy(&(mod->client_info), value, sizeof(mod->client_info));
     }
+    else if (strcasecmp(name, "audio_codec") == 0) {
+        mod->audioAllowAac = strcasecmp(value, "pcm") == 0 ? 0 : 1;
+    }
     else if (strcasecmp(name, "virtualmon") == 0) {
         if (strcasecmp(value, "yes") == 0) {
             mod->usevirtualmon = 1;
@@ -378,6 +381,7 @@ mod_init(void)
     
     mod->size = sizeof(struct mod);
     mod->version = CURRENT_MOD_VER;
+    mod->audioAllowAac = 1;
     mod->mod_connect = lib_mod_connect;
     mod->mod_start = lib_mod_start;
     mod->mod_event = lib_mod_event;

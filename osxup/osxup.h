@@ -192,6 +192,7 @@ struct mod
     int usevirtualmon;
     int recordFormat;
     int usevtoolbox;
+    int audioAllowAac;  // xrdp.ini audio_codec (auto: AAC 지원 클라이언트에 AAC 사용, pcm: PCM 만 사용)
     
     struct xrdp_client_info client_info;
 

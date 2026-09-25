@@ -24,7 +24,7 @@ public:
 
     void SendClipboardMsg(xipc_t* agentIpc, int channelId, int channelFlags, const char* data, int dataLen, int totalLen);
 
-    void SendAudioStartMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample);
+    void SendAudioStartMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample, int codec);
     
     void SendMicFormatMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample);
     void SendMicDataMsg(xipc_t* agentIpc, const void* pcm, int pcmLen);

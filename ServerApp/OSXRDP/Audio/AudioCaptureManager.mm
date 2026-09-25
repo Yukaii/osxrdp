@@ -18,11 +18,19 @@ static const int MAX_RESTART_COUNT = 5;
 static const int64_t RESTART_DELAY_NS = 1 * NSEC_PER_SEC;
 static const int64_t STOP_TIMEOUT_NS = 3 * NSEC_PER_SEC;
 
+// 무음이 시작된 뒤에도 잠시 전송 (AAC 인코더의 lookahead 에 남은 소리를 내보내고 클라이언트 버퍼를 비움)
+static const int SILENCE_HANGOVER_MS = 250;
+
+// AAC-LC (xrdp chansrv 와 동일: raw frame, frame 당 1024 sample)
+static const AVAudioFrameCount AAC_FRAMES_PER_PACKET = 1024;
+static const NSInteger AAC_BIT_RATE = 96000;
+
 API_AVAILABLE(macos(13.0))
 @interface AudioCaptureImpl : NSObject<SCStreamOutput, SCStreamDelegate>
 
 - (instancetype)initWithSampleRate:(int)sampleRate
                           Channels:(int)channels
+                             Codec:(int)codec
                       DataCallback:(on_audio_data)cb
               DataCallbackUserData:(void*)userData;
 - (BOOL)start;
@@ -43,10 +51,19 @@ API_AVAILABLE(macos(13.0))
 
     BOOL _stopped;
     int _restartCount;
+    int _silentFrames;
+
+    // AAC 인코딩 (codec == OSXRDP_AUDIO_CODEC_AAC)
+    AVAudioConverter* _aacEncoder;
+    AVAudioFormat* _aacFormat;
+    AVAudioPCMBuffer* _aacInput;        // 인코더에 넣을 1024 frame
+    int16_t* _aacFifo;                  // 1024 frame 미만으로 남은 PCM
+    AVAudioFrameCount _aacFifoFrames;
 }
 
 - (instancetype)initWithSampleRate:(int)sampleRate
                           Channels:(int)channels
+                             Codec:(int)codec
                       DataCallback:(on_audio_data)cb
               DataCallbackUserData:(void*)userData {
     self = [super init];
@@ -55,6 +72,11 @@ API_AVAILABLE(macos(13.0))
                                                          sampleRate:sampleRate
                                                            channels:channels
                                                         interleaved:YES];
+
+        if (codec == OSXRDP_AUDIO_CODEC_AAC && [self createAACEncoderWithSampleRate:sampleRate channels:channels] == NO) {
+            NSLog(@"[AudioCaptureImpl] could not create AAC encoder");
+            _outputFormat = nil;
+        }
         _dataCb = cb;
         _dataCbUserData = userData;
         _stopped = NO;
@@ -65,6 +87,82 @@ API_AVAILABLE(macos(13.0))
     }
 
     return self;
+}
+
+- (void)dealloc {
+    free(_aacFifo);
+}
+
+- (BOOL)createAACEncoderWithSampleRate:(int)sampleRate channels:(int)channels {
+    _aacFormat = [[AVAudioFormat alloc] initWithSettings:@{
+        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+        AVSampleRateKey: @(sampleRate),
+        AVNumberOfChannelsKey: @(channels),
+    }];
+    if (_aacFormat == nil) {
+        return NO;
+    }
+
+    _aacEncoder = [[AVAudioConverter alloc] initFromFormat:_outputFormat toFormat:_aacFormat];
+    if (_aacEncoder == nil) {
+        return NO;
+    }
+    _aacEncoder.bitRate = AAC_BIT_RATE;
+
+    _aacInput = [[AVAudioPCMBuffer alloc] initWithPCMFormat:_outputFormat frameCapacity:AAC_FRAMES_PER_PACKET];
+    _aacFifo = (int16_t*)calloc(AAC_FRAMES_PER_PACKET * channels, sizeof(int16_t));
+    _aacFifoFrames = 0;
+
+    return _aacInput != nil && _aacFifo != NULL;
+}
+
+// PCM 을 1024 frame 단위로 AAC 인코딩하여 packet (raw AAC frame) 단위로 전달
+- (void)encodeAAC:(const int16_t*)samples frames:(AVAudioFrameCount)frameCount {
+    UInt32 channels = _outputFormat.channelCount;
+
+    while (frameCount > 0) {
+        AVAudioFrameCount copyFrames = MIN(frameCount, AAC_FRAMES_PER_PACKET - _aacFifoFrames);
+        memcpy(_aacFifo + _aacFifoFrames * channels, samples, copyFrames * channels * sizeof(int16_t));
+        _aacFifoFrames += copyFrames;
+        samples += copyFrames * channels;
+        frameCount -= copyFrames;
+
+        if (_aacFifoFrames < AAC_FRAMES_PER_PACKET) {
+            break;
+        }
+
+        memcpy(_aacInput.mutableAudioBufferList->mBuffers[0].mData, _aacFifo, AAC_FRAMES_PER_PACKET * channels * sizeof(int16_t));
+        _aacInput.frameLength = AAC_FRAMES_PER_PACKET;
+        _aacFifoFrames = 0;
+
+        AVAudioCompressedBuffer* packet = [[AVAudioCompressedBuffer alloc] initWithFormat:_aacFormat
+                                                                           packetCapacity:1
+                                                                        maximumPacketSize:_aacEncoder.maximumOutputPacketSize];
+
+        // 인코더 lookahead 로 처음 몇 번은 packet 이 나오지 않을 수 있음
+        __block BOOL supplied = NO;
+        AVAudioPCMBuffer* input = _aacInput;
+        NSError* err = nil;
+        AVAudioConverterOutputStatus status = [_aacEncoder convertToBuffer:packet error:&err withInputFromBlock:^AVAudioBuffer* _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus* outStatus) {
+            if (supplied) {
+                *outStatus = AVAudioConverterInputStatus_NoDataNow;
+                return nil;
+            }
+
+            supplied = YES;
+            *outStatus = AVAudioConverterInputStatus_HaveData;
+            return input;
+        }];
+
+        if (status == AVAudioConverterOutputStatus_Error) {
+            continue;
+        }
+
+        for (AVAudioPacketCount i = 0; i < packet.packetCount; i++) {
+            const AudioStreamPacketDescription* desc = &packet.packetDescriptions[i];
+            _dataCb((const uint8_t*)packet.data + desc->mStartOffset, (int)desc->mDataByteSize, _dataCbUserData);
+        }
+    }
 }
 
 - (BOOL)start {
@@ -217,7 +315,7 @@ API_AVAILABLE(macos(13.0))
     const int16_t* samples = outputBuffer.int16ChannelData[0];
     int sampleCount = (int)(outputBuffer.frameLength * _outputFormat.channelCount);
 
-    // 무음 구간은 전송하지 않음 (불필요한 대역폭 사용 방지)
+    // 무음 여부 확인
     bool silent = true;
     for (int i = 0; i < sampleCount; i++) {
         if (samples[i] != 0) {
@@ -226,11 +324,23 @@ API_AVAILABLE(macos(13.0))
         }
     }
 
+    // 무음 구간은 hangover 이후 전송하지 않음 (불필요한 대역폭 사용 방지)
     if (silent) {
-        return;
+        _silentFrames += (int)outputBuffer.frameLength;
+        if (_silentFrames > (int)_outputFormat.sampleRate * SILENCE_HANGOVER_MS / 1000) {
+            return;
+        }
+    }
+    else {
+        _silentFrames = 0;
     }
 
-    _dataCb(samples, sampleCount * (int)sizeof(int16_t), _dataCbUserData);
+    if (_aacEncoder != nil) {
+        [self encodeAAC:samples frames:outputBuffer.frameLength];
+    }
+    else {
+        _dataCb(samples, sampleCount * (int)sizeof(int16_t), _dataCbUserData);
+    }
 }
 
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
@@ -295,8 +405,9 @@ void AudioCaptureManager::HandleCommand(xipc_t* client, xstream_t* cmd) {
             int sampleRate = xstream_readInt32(cmd);
             int channels = xstream_readInt32(cmd);
             int bitsPerSample = xstream_readInt32(cmd);
+            int codec = xstream_readInt32(cmd); // 이전 osxup 은 보내지 않음 (0 = PCM)
 
-            Start(client, sampleRate, channels, bitsPerSample);
+            Start(client, sampleRate, channels, bitsPerSample, codec);
             break;
         }
         default:
@@ -304,7 +415,7 @@ void AudioCaptureManager::HandleCommand(xipc_t* client, xstream_t* cmd) {
     }
 }
 
-void AudioCaptureManager::Start(xipc_t* client, int sampleRate, int channels, int bitsPerSample) {
+void AudioCaptureManager::Start(xipc_t* client, int sampleRate, int channels, int bitsPerSample, int codec) {
     // 잠금 화면 agent (root) 에서는 오디오를 캡처하지 않음
     if (is_root_process() != 0) {
         return;
@@ -323,6 +434,7 @@ void AudioCaptureManager::Start(xipc_t* client, int sampleRate, int channels, in
 
         AudioCaptureImpl* impl = [[AudioCaptureImpl alloc] initWithSampleRate:sampleRate
                                                                      Channels:channels
+                                                                        Codec:codec
                                                                  DataCallback:OnAudioData
                                                          DataCallbackUserData:this];
         if (impl == nil) {

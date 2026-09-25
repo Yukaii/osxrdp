@@ -513,7 +513,8 @@ void ConnectionManager::_RequestAudioIfReady() {
     _command.SendAudioStartMsg(_agentIpc,
                                _soundChannel.GetSampleRate(),
                                _soundChannel.GetChannels(),
-                               _soundChannel.GetBitsPerSample());
+                               _soundChannel.GetBitsPerSample(),
+                               _soundChannel.GetCodec());
     _audioRequested = true;
 }
 

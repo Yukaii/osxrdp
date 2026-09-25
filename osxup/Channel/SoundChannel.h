@@ -33,13 +33,14 @@ public:
     // 오디오 데이터를 전송할 수 있는 상태인지 (training 완료)
     bool IsReady() const;
 
-    // 협상된 PCM 포맷 조회
+    // 협상된 포맷 조회
+    int GetCodec() const;   // OSXRDP_AUDIO_CODEC_*
     int GetSampleRate() const;
     int GetChannels() const;
     int GetBitsPerSample() const;
 
-    // 협상된 포맷의 interleaved PCM 데이터 전송
-    void SendAudio(const void* pcm, int pcmLen);
+    // 협상된 포맷의 데이터 전송 (PCM: interleaved PCM, AAC: frame 1개)
+    void SendAudio(const void* data, int dataLen);
 
 private:
     enum class State {
@@ -65,6 +66,8 @@ private:
 
     int _clientVersion;
     int _clientFormatNo;    // 클라이언트 포맷 목록 내 index (wFormatNo)
+    bool _allowAac;
+    int _codec;
     int _sampleRate;
     int _channels;
     int _bitsPerSample;
@@ -72,8 +75,8 @@ private:
 
     uint8_t _blockNo;               // 다음에 보낼 cBlockNo
     uint8_t _lastConfirmedBlockNo;
-    int _blockBytes[256];           // block 별 전송량 (미확인 데이터량 계산용)
-    int64_t _unconfirmedBytes;
+    int64_t _blockDurationUs[256];  // block 별 재생 시간 (미확인 재생 시간 계산용)
+    int64_t _unconfirmedUs;
     uint64_t _lastConfirmTimeMs;
     uint64_t _audioStartTimeMs;
 
@@ -84,7 +87,7 @@ private:
 
     void _SendTraining();
     bool _ShouldDropBlock();
-    void _TrackSentBlock(int pcmLen);
+    void _TrackSentBlock(int64_t durationUs);
 
     // 가상 채널 chunk 크기(1600)에 맞춰 분할 전송
     void _SendPdu(const uint8_t* pdu, int pduLen);

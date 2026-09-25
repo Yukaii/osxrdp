@@ -29,8 +29,12 @@
 #define OSXRDP_CMDTYPE_NEEDPAINT 4
 
 #define OSXRDP_CMDTYPE_AUDIO 5
-#define OSXRDP_PACKETTYPE_REQ_AUDIOSTART 1  // osxup -> agent (sampleRate, channels, bitsPerSample)
-#define OSXRDP_PACKETTYPE_AUDIODATA      2  // agent -> osxup (dataLen, interleaved PCM)
+#define OSXRDP_PACKETTYPE_REQ_AUDIOSTART 1  // osxup -> agent (sampleRate, channels, bitsPerSample, codec)
+#define OSXRDP_PACKETTYPE_AUDIODATA      2  // agent -> osxup (dataLen, interleaved PCM 또는 AAC frame 1개)
+
+// REQ_AUDIOSTART codec
+#define OSXRDP_AUDIO_CODEC_PCM 0
+#define OSXRDP_AUDIO_CODEC_AAC 1            // AAC-LC raw frame (ADTS 없음), frame 당 1024 sample
 
 // ipc 수신 버퍼(MAX_BUFFER, 16KB)를 넘지 않도록 audio 데이터 1회 전송량 제한
 #define OSXRDP_AUDIO_MAX_CHUNK 8192
