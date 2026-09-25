@@ -60,7 +60,7 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
         return false;
     }
 
-    if (ResolveDisplayForRecorder() == false) {
+    if (ResolveDisplayForRecorder(false) == false) {
         return false;
     }
 
@@ -72,6 +72,16 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
         _virtualMonitor.HoldDisplaySleepAssertion();
     }
     
+    if (StartRecorders() == false) {
+        DestroyRecordShm();
+        DestroyCursorShm();
+        return false;
+    }
+
+    return true;
+}
+
+bool ScreenRecorderManager::StartRecorders() {
     for (int i = 0; i < _recordParams.monitorCount; i++) {
         id<IScreenRecorder> impl = nil;
         
@@ -106,13 +116,59 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
                     RecordCmdCallback:HandleRecordCommand RecordCmdCallbackUserData:this];
 
         if ([impl start] == NO) {
-            DestroyRecordShm();
-            DestroyCursorShm();
             return false;
         }
         
         _recorder[_recorderCnt] = (__bridge_retained void*)impl;
         _recorderCnt++;
+    }
+
+    return true;
+}
+
+bool ScreenRecorderManager::ResizeRecord(xstream_t* cmd) {
+    RecordStartParams newParams;
+    memset(&newParams, 0x00, sizeof(struct RecordStartParams));
+
+    if (ParseStartRecordParams(cmd, &newParams) == false) {
+        return false;
+    }
+
+    // 녹화와 녹화용 공유 메모리만 재생성 (커서 공유 메모리, 가상 모니터는 가능하면 유지)
+    StopRecorders();
+    DestroyRecordShm();
+
+    bool reuseVirtualMonitor = (newParams.useVirtualMon != 0 && _recordParams.useVirtualMon != 0 &&
+                                newParams.monitorCount == _virtualMonitor.GetCount());
+
+    _recordParams = newParams;
+
+    if (_recordParams.recordFormat == OSXRDP_RECORDFORMAT_RFX && InitRFXConversion() == false) {
+        return false;
+    }
+
+    if (ResolveDisplayForRecorder(reuseVirtualMonitor) == false) {
+        return false;
+    }
+
+    for (int i = 0; i < _recordParams.monitorCount; i++) {
+        if (CreateRecordShm(i) == false) {
+            NSLog(@"[ScreenRecorderManager::ResizeRecord] could not create record shm");
+            DestroyRecordShm();
+            return false;
+        }
+    }
+
+    if (_cursorShm == NULL && CreateCursorShm() == false) {
+        DestroyRecordShm();
+        return false;
+    }
+
+    ResetPendingDirty();
+
+    if (StartRecorders() == false) {
+        DestroyRecordShm();
+        return false;
     }
 
     return true;
@@ -218,7 +274,7 @@ bool ScreenRecorderManager::PrepareRecordResources() {
     return true;
 }
 
-bool ScreenRecorderManager::ResolveDisplayForRecorder() {
+bool ScreenRecorderManager::ResolveDisplayForRecorder(bool reuseVirtualMonitor) {
 
     if (_recordParams.useVirtualMon == 0) {
         _recordParams.monitorInfo[0].displayId = (int)CGMainDisplayID();
@@ -253,6 +309,25 @@ bool ScreenRecorderManager::ResolveDisplayForRecorder() {
         }
     }
 
+    // 해상도 변경 시 기존 가상 모니터를 재사용 (물리 모니터가 잠깐 켜지는 것을 방지)
+    bool resized = false;
+    if (reuseVirtualMonitor) {
+        resized = true;
+        for (int i = 0; i < _recordParams.monitorCount; i++) {
+            if (_virtualMonitor.Resize(i, GetMonitorRecordWidth(i), GetMonitorRecordHeight(i),
+                                       _recordParams.monitorInfo[i].left, _recordParams.monitorInfo[i].top,
+                                       _recordParams.monitorInfo[i].is_primary != 0) == false) {
+                resized = false;
+                break;
+            }
+        }
+        
+        if (resized == false) {
+            NSLog(@"[ScreenRecorderManager::ResolveDisplayForRecorder] could not resize virtual monitor. recreate it");
+            _virtualMonitor.Destroy();
+        }
+    }
+
     for (int i = 0; i < _recordParams.monitorCount; i++) {
         // todo : 성공,실패 판별
 
@@ -261,7 +336,9 @@ bool ScreenRecorderManager::ResolveDisplayForRecorder() {
         int displayOriginX = _recordParams.monitorInfo[i].left - primaryLeft;
         int displayOriginY = _recordParams.monitorInfo[i].top - primaryTop;
 
-        _virtualMonitor.Create(monitorWidth, monitorHeight, _recordParams.monitorInfo[i].left, _recordParams.monitorInfo[i].top, _recordParams.monitorInfo[i].outputIndex, _recordParams.monitorInfo[i].is_primary != 0);
+        if (resized == false) {
+            _virtualMonitor.Create(monitorWidth, monitorHeight, _recordParams.monitorInfo[i].left, _recordParams.monitorInfo[i].top, _recordParams.monitorInfo[i].outputIndex, _recordParams.monitorInfo[i].is_primary != 0);
+        }
 
         _recordParams.monitorInfo[i].displayId = _virtualMonitor.GetDisplayId(i);
         _recordParams.monitorInfo[i].refresh_rate = _virtualMonitor.GetDisplayRefreshRate(i);
@@ -409,10 +486,7 @@ void ScreenRecorderManager::DestroyCursorShm() {
     _cursorShm = NULL;
 }
 
-void ScreenRecorderManager::Stop() {
-    _inputHandler.ReleaseAllInputs();
-
-    // 화면 녹화를 먼저 정지
+void ScreenRecorderManager::StopRecorders() {
     for (int i = 0; i < _recorderCnt; i++) {
         id<IScreenRecorder> impl = (__bridge id<IScreenRecorder>)_recorder[i];
         if ([impl stop] == NO) {
@@ -428,6 +502,13 @@ void ScreenRecorderManager::Stop() {
     
     _recorderCnt = 0;
     memset(_recorder, 0x00, sizeof(_recorder));
+}
+
+void ScreenRecorderManager::Stop() {
+    _inputHandler.ReleaseAllInputs();
+
+    // 화면 녹화를 먼저 정지
+    StopRecorders();
     
     if (_recordParams.useVirtualMon == 0) {
         _virtualMonitor.ReleaseDisplaySleepAssertion();
@@ -453,20 +534,15 @@ void ScreenRecorderManager::HandleCommand(xipc_t* client, xstream_t* cmd) {
             
             NSLog(@"[ScreenRecorderManager::HandleCommand] start record. result %d", re);
 
-            xstream* result = xstream_create(32);
-            if (result != NULL) {
-                xstream_writeInt32(result, OSXRDP_CMDTYPE_SCREEN);
-                xstream_writeInt32(result, OSXRDP_PACKETTYPE_REP_SCREEN);
-                xstream_writeInt32(result, re ? 1 : 0);
-                
-                int rawBufferLen = 0;
-                const void* rawBuffer = xstream_get_raw_buffer(result, &rawBufferLen);
-                
-                xipc_send_data(client, rawBuffer, rawBufferLen);
-                
-                xstream_free(result);
-            }
+            SendRecordResult(client, re);
+            break;
+        }
+        case OSXRDP_PACKETTYPE_REQ_SCREENRESIZE: {
+            bool re = ResizeRecord(cmd);
             
+            NSLog(@"[ScreenRecorderManager::HandleCommand] resize record. result %d", re);
+            
+            SendRecordResult(client, re);
             break;
         }
         case OSXRDP_PACKETTYPE_REQ_SCREENOFF: {
@@ -492,6 +568,24 @@ void ScreenRecorderManager::HandleCommand(xipc_t* client, xstream_t* cmd) {
             break;
         }
     }
+}
+
+void ScreenRecorderManager::SendRecordResult(xipc_t* client, bool result) {
+    xstream* msg = xstream_create(32);
+    if (msg == NULL) {
+        return;
+    }
+    
+    xstream_writeInt32(msg, OSXRDP_CMDTYPE_SCREEN);
+    xstream_writeInt32(msg, OSXRDP_PACKETTYPE_REP_SCREEN);
+    xstream_writeInt32(msg, result ? 1 : 0);
+    
+    int rawBufferLen = 0;
+    const void* rawBuffer = xstream_get_raw_buffer(msg, &rawBufferLen);
+    
+    xipc_send_data(client, rawBuffer, rawBufferLen);
+    
+    xstream_free(msg);
 }
 
 void ScreenRecorderManager::SendDisconnectMsgToClient() {

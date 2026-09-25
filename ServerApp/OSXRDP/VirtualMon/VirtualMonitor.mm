@@ -74,50 +74,30 @@ bool VirtualMonitor::Create(int width, int height, int left, int top, int index,
     WakeupDisplay();
 
     // retina 여부 판단
-    int scale = ((width > 3440) || (width > 2300 && height > 1500)) == true ? 2 : 1;
+    int scale = CalcScale(width, height);
     int refreshRate = CalcRefreshRate(width, height);
 
     // 가상 디스플레이를 생성
     CGVirtualDisplayDescriptor* desc = [[CGVirtualDisplayDescriptor alloc] init];
     if (desc == nil) return false;
 
+    // 회전(가로/세로 전환) 시 재생성 없이 해상도를 바꿀 수 있도록 최대 크기는 긴 변 기준의 정사각형으로 설정
+    int maxPixels = width > height ? width : height;
+
     // 가상 디스플레이의 기본 속성
     desc.queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     desc.name = @"OSXRDP Virtual Display";
-    desc.maxPixelsWide = width;
-    desc.maxPixelsHigh = height;
+    desc.maxPixelsWide = maxPixels;
+    desc.maxPixelsHigh = maxPixels;
     desc.sizeInMillimeters = CGSizeMake((double)(width / scale) * 25.4 / 96.0,
                                         (double)(height / scale) * 25.4 / 96.0);
     desc.productID = 0x5969 + index;
     desc.vendorID = 0x1207;
     desc.serialNum = 0x0007 + index;
 
-    CGVirtualDisplaySettings* settings = [[CGVirtualDisplaySettings alloc] init];
+    CGVirtualDisplaySettings* settings = CreateDisplaySettings(width, height, scale, refreshRate);
     if (settings == nil)
         return false;
-
-    settings.hiDPI = scale == 2 ? 1 : 0;
-
-    NSMutableArray* modes = [NSMutableArray array];
-
-    for (int i = 0; i < (int)(sizeof(baseModes) / sizeof(baseModes[0])); i++) {
-        int baseWidth = baseModes[i][0];
-        int baseHeight = baseModes[i][1];
-
-        // 원격 클라이언트 해상도와 중복되는 모드는 skip
-        if (baseWidth == width && baseHeight == height)
-            continue;
-
-        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:baseWidth height:baseHeight refreshRate:refreshRate]];
-    }
-
-    [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:width height:height refreshRate:refreshRate]];
-
-    if (scale == 2) {
-        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:width / 2 height:height / 2 refreshRate:refreshRate]];
-    }
-
-    settings.modes = modes;
 
     CGVirtualDisplay* virtualDisplay = [[CGVirtualDisplay alloc] initWithDescriptor:desc];
     if (virtualDisplay == nil)
@@ -144,11 +124,63 @@ bool VirtualMonitor::Create(int width, int height, int left, int top, int index,
     _virtualDisplayInfo[_virtualDisplayInfoCnt].is_primary = isPrimary ? true : false;
     _virtualDisplayInfo[_virtualDisplayInfoCnt].virtualDisplay = virtualDisplay;
     _virtualDisplayInfo[_virtualDisplayInfoCnt].refresh_rate = refreshRate;
+    _virtualDisplayInfo[_virtualDisplayInfoCnt].max_pixels = maxPixels;
     
     _virtualDisplayInfoCnt++;
 
     ApplyDisplayLayout();
 
+    return true;
+}
+
+bool VirtualMonitor::Resize(int index, int width, int height, int left, int top, bool isPrimary) {
+    if (index < 0 || index >= _virtualDisplayInfoCnt) {
+        return false;
+    }
+
+    struct VIRTUALMONITOR_INFO* displayInfo = &_virtualDisplayInfo[index];
+    if (displayInfo->virtualDisplay == nil || width > displayInfo->max_pixels || height > displayInfo->max_pixels) {
+        return false;
+    }
+
+    int scale = CalcScale(width, height);
+    int refreshRate = CalcRefreshRate(width, height);
+
+    CGVirtualDisplaySettings* settings = CreateDisplaySettings(width, height, scale, refreshRate);
+    if (settings == nil) {
+        return false;
+    }
+
+    // watch 스레드가 해상도/배치를 동시에 바꾸지 않도록 lock
+    pthread_mutex_lock(&_watchLock);
+
+    if ([displayInfo->virtualDisplay applySettings:settings] == NO) {
+        pthread_mutex_unlock(&_watchLock);
+        NSLog(@"[VirtualMonitor::Resize] applySettings failed %dx%d@%dHz scale=%d", width, height, refreshRate, scale);
+        return false;
+    }
+
+    displayInfo->left = left;
+    displayInfo->top = top;
+    displayInfo->width = width;
+    displayInfo->height = height;
+    displayInfo->is_retina = scale == 2 ? true : false;
+    displayInfo->is_primary = isPrimary ? true : false;
+    displayInfo->refresh_rate = refreshRate;
+
+    // 새 모드 목록이 반영될 때까지 잠시 재시도 (실패해도 watch 스레드가 다시 맞춘다)
+    for (int i = 0; i < 10; i++) {
+        if (SetResolution(index) == 0 && IsRightResolution(index)) {
+            break;
+        }
+        usleep(100 * 1000);
+    }
+
+    ApplyDisplayLayout();
+
+    pthread_mutex_unlock(&_watchLock);
+
+    NSLog(@"[VirtualMonitor::Resize] index=%d %dx%d@%dHz scale=%d", index, width, height, refreshRate, scale);
     return true;
 }
 
@@ -896,6 +928,41 @@ void VirtualMonitor::WatchThreadPorcInternal() {
         NSLog(@"[VirtualMonitor::WatchThreadProc] virtual display has invalid layout. try change it");
         ApplyDisplayLayout();
     }
+}
+
+int VirtualMonitor::CalcScale(int width, int height) {
+    return ((width > 3440) || (width > 2300 && height > 1500)) == true ? 2 : 1;
+}
+
+CGVirtualDisplaySettings* VirtualMonitor::CreateDisplaySettings(int width, int height, int scale, int refreshRate) {
+    CGVirtualDisplaySettings* settings = [[CGVirtualDisplaySettings alloc] init];
+    if (settings == nil)
+        return nil;
+
+    settings.hiDPI = scale == 2 ? 1 : 0;
+
+    NSMutableArray* modes = [NSMutableArray array];
+
+    for (int i = 0; i < (int)(sizeof(baseModes) / sizeof(baseModes[0])); i++) {
+        int baseWidth = baseModes[i][0];
+        int baseHeight = baseModes[i][1];
+
+        // 원격 클라이언트 해상도와 중복되는 모드는 skip
+        if (baseWidth == width && baseHeight == height)
+            continue;
+
+        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:baseWidth height:baseHeight refreshRate:refreshRate]];
+    }
+
+    [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:width height:height refreshRate:refreshRate]];
+
+    if (scale == 2) {
+        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:width / 2 height:height / 2 refreshRate:refreshRate]];
+    }
+
+    settings.modes = modes;
+
+    return settings;
 }
 
 // EDID 의 픽셀 클럭 필드는 10kHz 단위 16비트라 macOS 는 655.35MHz 를 넘는 타이밍을 담지 못하는것으로 보인다. (추측, 여러 테스트를 기반)

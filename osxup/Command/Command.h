@@ -12,6 +12,7 @@ class Command {
 public:
     
     void SendRecordStartMsg(xipc_t* agentIpc, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo);
+    void SendRecordResizeMsg(xipc_t* agentIpc, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo);
     void SendRecordStopMsg(xipc_t* agentIpc);
     
     void SendMouseInputMsg(xipc_t* agentIpc, int inputType, short x, short y, int delta);
@@ -27,6 +28,7 @@ public:
     
 private:
     
+    void _SendRecordMsg(xipc_t* agentIpc, int packetType, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo);
     void _SendMsg(xipc_t* ipc, xstream_t* stream);
 };
 

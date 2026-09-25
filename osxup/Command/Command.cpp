@@ -3,6 +3,14 @@
 #include "osxrdp/packet.h"
 
 void Command::SendRecordStartMsg(xipc_t* agentIpc, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo) {
+    _SendRecordMsg(agentIpc, OSXRDP_PACKETTYPE_REQ_SCREEN, width, height, recordFormat, useVirtualmon, monitorCount, monitorInfo);
+}
+
+void Command::SendRecordResizeMsg(xipc_t* agentIpc, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo) {
+    _SendRecordMsg(agentIpc, OSXRDP_PACKETTYPE_REQ_SCREENRESIZE, width, height, recordFormat, useVirtualmon, monitorCount, monitorInfo);
+}
+
+void Command::_SendRecordMsg(xipc_t* agentIpc, int packetType, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo) {
     assert(agentIpc != NULL);
     assert(width > 0);
     assert(height > 0);
@@ -14,7 +22,7 @@ void Command::SendRecordStartMsg(xipc_t* agentIpc, int width, int height, int re
     }
 
     xstream_writeInt32(stream, OSXRDP_CMDTYPE_SCREEN);
-    xstream_writeInt32(stream, OSXRDP_PACKETTYPE_REQ_SCREEN);
+    xstream_writeInt32(stream, packetType);
     xstream_writeInt32(stream, 0);              // display index 등 (unused)
     xstream_writeInt32(stream, width);          // width
     xstream_writeInt32(stream, height);         // height

@@ -15,6 +15,7 @@ struct VIRTUALMONITOR_INFO {
     int is_primary;
     CGVirtualDisplay* virtualDisplay;
     int refresh_rate;
+    int max_pixels; // 생성 시 descriptor 의 maxPixelsWide/High (이 크기 이내로만 재설정 가능)
 };
 
 class VirtualMonitor {
@@ -24,6 +25,14 @@ public:
     
     // 가상 모니터를 생성
     bool Create(int width, int height, int left, int top, int index, bool isPrimary = false);
+    
+    // 기존 가상 모니터의 해상도/위치를 변경 (클라이언트 창 크기 변경, 회전 등)
+    // 생성 시 최대 크기를 넘는 경우 false (호출자가 재생성해야 함)
+    bool Resize(int index, int width, int height, int left, int top, bool isPrimary);
+    
+    int GetCount() {
+        return _virtualDisplayInfoCnt;
+    }
     
     // 모든 가상 모니터를 파괴
     void Destroy();
@@ -77,6 +86,8 @@ private:
     bool IsRightPrimaryDisplay();
     bool IsRightDisplayLayout();
     int CalcRefreshRate(int width, int height);
+    static int CalcScale(int width, int height);
+    static CGVirtualDisplaySettings* CreateDisplaySettings(int width, int height, int scale, int refreshRate);
 
     int SetResolution(int index);
     bool IsRightResolution(int index);

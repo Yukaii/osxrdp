@@ -10,6 +10,9 @@ static const char* OSXRDP_AGENT_NAME = "/tmp/osxrdp";
 
 static const int OSXRDP_RECONNECT_WAITCNT = 30;
 
+// agent 가 해상도 변경에 응답하지 않을 경우 xrdp 의 resize 상태 머신이 멈추지 않도록 완료 처리
+static const uint64_t OSXRDP_RESIZE_TIMEOUT_MS = 15000;
+
 namespace {
 inline void AddWaitObject(void* read_objs, int* rcount, int fd) {
     if (read_objs == NULL || rcount == NULL || fd < 0) {
@@ -18,6 +21,12 @@ inline void AddWaitObject(void* read_objs, int* rcount, int fd) {
 
     ((intptr_t*)read_objs)[*rcount] = (intptr_t)fd;
     (*rcount)++;
+}
+
+inline uint64_t NowMs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 }
 
@@ -29,7 +38,10 @@ ConnectionManager::ConnectionManager() :
     _mod(NULL),
     _pendingInputSync(false),
     _pendingToggleFlags(0),
-    _audioRequested(false)
+    _audioRequested(false),
+    _resizePending(false),
+    _recordSizeDirty(false),
+    _resizeStartMs(0)
 {}
 
 ConnectionManager::~ConnectionManager() {}
@@ -104,6 +116,11 @@ void ConnectionManager::Release() {
 }
 
 void ConnectionManager::KeepAlive() {
+    if (_resizePending && NowMs() - _resizeStartMs > OSXRDP_RESIZE_TIMEOUT_MS) {
+        printf("[ConnectionManager] resize timed out\n");
+        _CompleteResize();
+    }
+    
     // agent ipc 와 연결된 경우
     if (_agentIpc != NULL) {
         // 쌓인 메시지를 처리
@@ -332,12 +349,7 @@ bool ConnectionManager::_ConnectToAgent(int sessionId, bool isLockScreen) {
     _statusManager.SetAgentConnected(isLockScreen);
     
     // 화면 녹화 데이터 요청
-    if (_mod->client_info.display_sizes.monitorCount == 0) {
-        _command.SendRecordStartMsg(ipc, _mod->width, _mod->height, PaintManager::CheckRecordFormat(_mod), _mod->usevirtualmon, 0, 0);
-    }
-    else {
-        _command.SendRecordStartMsg(ipc, _mod->width, _mod->height, PaintManager::CheckRecordFormat(_mod), _mod->usevirtualmon, _mod->client_info.display_sizes.monitorCount, (struct monitor_info*)_mod->client_info.display_sizes.minfo_wm);
-    }
+    _SendRecordRequest(ipc, false);
     
     
     // 클립보드 활성화
@@ -370,6 +382,83 @@ bool ConnectionManager::_PreparePaint() {
     _RequestAudioIfReady();
     
     return true;
+}
+
+void ConnectionManager::Resize(int* inProgress) {
+    *inProgress = 0;
+    
+    if (_agentIpc == NULL) {
+        // agent 연결 전 (또는 재연결 중). 다음 녹화 요청에서 새 해상도를 사용
+        _recordSizeDirty = false;
+        return;
+    }
+    
+    _recordSizeDirty = true;
+    _resizePending = true;
+    _resizeStartMs = NowMs();
+    *inProgress = 1;
+    
+    // 녹화 시작 응답을 기다리는 중이면 응답을 받은 뒤 해상도 변경 요청 (_HandleRecordReply)
+    if (_statusManager.CheckCanAcceptInput() == false) {
+        return;
+    }
+    
+    // 녹화 중 -> 기존 공유 메모리를 닫고 새 해상도로 녹화를 재구성
+    // (xrdp 가 resize 시작 시 encoder 를 먼저 삭제하므로 in-flight 프레임을 기다릴 필요가 없음)
+    bool inLockscreen = _statusManager.CheckReconnection(); // AGENT_RECORD_LOCKSCREEN
+    _paintManager.Release();
+    _statusManager.SetAgentConnected(inLockscreen);
+    
+    _SendRecordRequest(_agentIpc, true);
+}
+
+void ConnectionManager::_SendRecordRequest(xipc_t* ipc, bool resize) {
+    int recordFormat = PaintManager::CheckRecordFormat(_mod);
+    int monitorCount = _mod->client_info.display_sizes.monitorCount;
+    struct monitor_info* monitors = monitorCount == 0 ? NULL : (struct monitor_info*)_mod->client_info.display_sizes.minfo_wm;
+    
+    if (resize) {
+        _command.SendRecordResizeMsg(ipc, _mod->width, _mod->height, recordFormat, _mod->usevirtualmon, monitorCount, monitors);
+    }
+    else {
+        _command.SendRecordStartMsg(ipc, _mod->width, _mod->height, recordFormat, _mod->usevirtualmon, monitorCount, monitors);
+    }
+    
+    // agent 는 현재 mod 해상도로 녹화하게 됨
+    _recordSizeDirty = false;
+}
+
+void ConnectionManager::_HandleRecordReply(bool succeeded) {
+    if (succeeded == false) {
+        // log
+        _CompleteResize();
+        _statusManager.SetStopping();
+        return;
+    }
+    
+    // 녹화 시작 응답 대기 중에 해상도가 바뀐 경우 -> 새 해상도로 다시 요청
+    if (_recordSizeDirty && _agentIpc != NULL) {
+        _SendRecordRequest(_agentIpc, true);
+        return;
+    }
+    
+    if (_PreparePaint() == false) {
+        // log
+        _CompleteResize();
+        _statusManager.SetStopping();
+        return;
+    }
+    
+    _CompleteResize();
+}
+
+void ConnectionManager::_CompleteResize() {
+    if (_resizePending == false) {
+        return;
+    }
+    
+    _resizePending = false;
+    _mod->server_monitor_resize_done((struct mod*)_mod);
 }
 
 void ConnectionManager::_RequestAudioIfReady() {
@@ -470,10 +559,7 @@ int ConnectionManager::_OnReceivedAgentManagerMessage(xipc_t* t, xipc_t* client,
             int packetType = xstream_readInt32(stream);
             if (packetType == OSXRDP_PACKETTYPE_REP_SCREEN) {
                 int re = xstream_readInt32(stream);
-                if (re != 1 || _this->_PreparePaint() == false) {
-                    // log
-                    _this->_statusManager.SetStopping();
-                }
+                _this->_HandleRecordReply(re == 1);
             }
             break;
         }

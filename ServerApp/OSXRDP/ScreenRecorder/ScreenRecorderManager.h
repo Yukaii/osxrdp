@@ -82,13 +82,20 @@ private:
     void DestroyCursorShm();
     
     bool StartRecord(xstream_t* cmd);
+    
+    // 클라이언트 해상도 변경 (dynamic resize) 시 녹화 재구성
+    bool ResizeRecord(xstream_t* cmd);
+    
+    bool StartRecorders();
+    void StopRecorders();
+    void SendRecordResult(xipc_t* client, bool result);
     bool InitRFXConversion();
     
     bool ParseStartRecordParams(xstream_t* cmd, RecordStartParams* params);
     bool PrepareRecordResources();
     
     // 녹화기 설정
-    bool ResolveDisplayForRecorder();
+    bool ResolveDisplayForRecorder(bool reuseVirtualMonitor);
     int GetMonitorRecordWidth(int recordIdx);
     int GetMonitorRecordHeight(int recordIdx);
 

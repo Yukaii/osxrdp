@@ -287,6 +287,49 @@ lib_send_server_monitor_resize(struct mod *mod, int width, int height,
                                const struct monitor_info *monitors,
                                int *in_progress)
 {
+    *in_progress = 0;
+
+    if (width <= 0 || height <= 0) {
+        return 1;
+    }
+
+    // 홀수 해상도일 경우 nv12 인코딩에서 문제가 발생 (lib_mod_start 와 동일)
+    mod->width = width & ~0x1;
+    mod->height = height & ~0x1;
+
+    struct display_size_description* sizes = &mod->client_info.display_sizes;
+
+    // 다중 모니터는 H.264 에서만 지원하므로 그 외에는 단일 모니터로 처리
+    if (num_monitors < 0 || num_monitors > CLIENT_MONITOR_DATA_MAXIMUM_MONITORS || monitors == NULL ||
+        (num_monitors > 1 && PaintManager::CheckRecordFormat(mod) != OSXRDP_RECORDFORMAT_NV12_PACKED)) {
+        num_monitors = 0;
+    }
+
+    sizes->monitorCount = num_monitors;
+    sizes->session_width = width;
+    sizes->session_height = height;
+
+    if (num_monitors > 0) {
+        // minfo_wm 은 음수 좌표가 없도록 가장 왼쪽/위 모니터를 원점으로 이동한 값
+        int minLeft = monitors[0].left;
+        int minTop = monitors[0].top;
+        for (int i = 1; i < num_monitors; i++) {
+            if (monitors[i].left < minLeft) minLeft = monitors[i].left;
+            if (monitors[i].top < minTop) minTop = monitors[i].top;
+        }
+
+        for (int i = 0; i < num_monitors; i++) {
+            sizes->minfo[i] = monitors[i];
+            sizes->minfo_wm[i] = monitors[i];
+            sizes->minfo_wm[i].left -= minLeft;
+            sizes->minfo_wm[i].right -= minLeft;
+            sizes->minfo_wm[i].top -= minTop;
+            sizes->minfo_wm[i].bottom -= minTop;
+        }
+    }
+
+    mod->connectionManager->Resize(in_progress);
+
     return 0;
 }
 
