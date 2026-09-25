@@ -1,6 +1,8 @@
+diff --git a/xrdp/xrdp_encoder_openh264.c b/xrdp/xrdp_encoder_openh264.c
+index f3fda5ed..315aa8c8 100644
 --- a/xrdp/xrdp_encoder_openh264.c
 +++ b/xrdp/xrdp_encoder_openh264.c
-@@ -192,6 +192,9 @@
+@@ -192,6 +192,9 @@ xrdp_encoder_openh264_encode(void *handle, int session, int left, int top,
                  encParamExt.iPicHeight = (height + 15) & ~15;
                  encParamExt.iRCMode = RC_BITRATE_MODE;
                  encParamExt.iSpatialLayerNum = 1;
@@ -10,13 +12,13 @@
                  /* Set encode parameters from config */
                  encParamExt.bEnableFrameSkip = og->openh264_param[ct].EnableFrameSkip;
                  encParamExt.iTargetBitrate = og->openh264_param[ct].TargetBitrate;
-@@ -205,8 +208,10 @@
+@@ -205,6 +208,10 @@ xrdp_encoder_openh264_encode(void *handle, int session, int left, int top,
                  slc->iVideoHeight = encParamExt.iPicHeight;
                  slc->iSpatialBitrate = encParamExt.iTargetBitrate;
                  slc->iMaxSpatialBitrate = encParamExt.iMaxBitrate;
 +
-                 slc->bVideoSignalTypePresent = 1;
-                 slc->bFullRange = 1;
++                slc->bVideoSignalTypePresent = 1;
++                slc->bFullRange = 1;
 +
                  status = ENC_INITIALIZE_EXT(
                               oe->openh264_enc_han, &encParamExt);
