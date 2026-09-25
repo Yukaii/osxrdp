@@ -815,6 +815,30 @@ index 00000000..0afcff6a
 +
 +    return 0;
 +}
+diff --git a/libxrdp/xrdp_channel.c b/libxrdp/xrdp_channel.c
+index 909949eb..343f35f5 100644
+--- a/libxrdp/xrdp_channel.c
++++ b/libxrdp/xrdp_channel.c
+@@ -335,8 +335,8 @@ drdynvc_process_open_channel_response(struct xrdp_channel *self,
+         return 1;
+     }
+     in_uint32_le(s, creation_status); /* CreationStatus */
+-    LOG_DEVEL(LOG_LEVEL_TRACE, "Received [MS-RDPEDYC] DYNVC_CREATE_RSP "
+-              "ChannelId %d, CreationStatus %d", chan_id, creation_status);
++    LOG(LOG_LEVEL_INFO, "Received [MS-RDPEDYC] DYNVC_CREATE_RSP "
++        "ChannelId %d, CreationStatus 0x%8.8x", chan_id, creation_status);
+     if (chan_id > 255)
+     {
+         LOG(LOG_LEVEL_ERROR, "Received [MS-RDPEDYC] DYNVC_CREATE_RSP for an "
+@@ -887,6 +887,8 @@ xrdp_channel_drdynvc_open(struct xrdp_channel *self, const char *name,
+         return 1;
+     }
+     free_stream(s);
++    LOG(LOG_LEVEL_INFO, "Sent [MS-RDPEDYC] DYNVC_CREATE_REQ "
++        "ChannelId %d, ChannelName [%s]", ChId, name);
+     *chan_id = ChId;
+     self->drdynvcs[ChId].open_response = procs->open_response;
+     self->drdynvcs[ChId].close_response = procs->close_response;
 diff --git a/libxrdp/xrdp_mcs.c b/libxrdp/xrdp_mcs.c
 index a49eb120..dabf142d 100644
 --- a/libxrdp/xrdp_mcs.c
@@ -972,7 +996,7 @@ index f3fda5ed..315aa8c8 100644
                               oe->openh264_enc_han, &encParamExt);
                  LOG(LOG_LEVEL_INFO, "xrdp_encoder_openh264_encode: "
 diff --git a/xrdp/xrdp_mm.c b/xrdp/xrdp_mm.c
-index 2a6a3009..5d8038ae 100644
+index 2a6a3009..8d56f3fb 100644
 --- a/xrdp/xrdp_mm.c
 +++ b/xrdp/xrdp_mm.c
 @@ -133,6 +133,315 @@ xrdp_mm_sync_load(long param1, long param2)
@@ -1311,7 +1335,45 @@ index 2a6a3009..5d8038ae 100644
              self->mod->si = &(self->wm->session->si);
          }
      }
-@@ -2184,6 +2499,8 @@ xrdp_mm_drdynvc_up(struct xrdp_mm *self)
+@@ -1206,12 +1521,27 @@ dynamic_monitor_close_response(intptr_t id, int chan_id)
+     return 0;
+ }
+ 
++/******************************************************************************/
++static int
++dynamic_monitor_data(intptr_t id, int chan_id, char *data, int bytes);
++
+ /******************************************************************************/
+ static int
+ dynamic_monitor_data_first(intptr_t id, int chan_id, char *data, int bytes,
+                            int total_bytes)
+ {
+-    LOG_DEVEL(LOG_LEVEL_TRACE, "dynamic_monitor_data_first:");
++    LOG(LOG_LEVEL_INFO, "dynamic_monitor_data_first: chan_id %d bytes %d "
++        "total_bytes %d", chan_id, bytes, total_bytes);
++
++    /* Some clients send even small PDUs as DYNVC_DATA_FIRST. A monitor
++     * layout PDU is small, so process it when it arrives in one piece. */
++    if (bytes == total_bytes)
++    {
++        return dynamic_monitor_data(id, chan_id, data, bytes);
++    }
++
++    LOG(LOG_LEVEL_WARNING, "dynamic_monitor_data_first: fragmented "
++        "DisplayControl PDU is not supported, ignored");
+     return 0;
+ }
+ 
+@@ -1683,7 +2013,7 @@ dynamic_monitor_data(intptr_t id, int chan_id, char *data, int bytes)
+     int monitor_layout_size;
+     struct display_size_description description;
+ 
+-    LOG_DEVEL(LOG_LEVEL_TRACE, "dynamic_monitor_data:");
++    LOG(LOG_LEVEL_INFO, "dynamic_monitor_data: chan_id %d bytes %d", chan_id, bytes);
+     pro = (struct xrdp_process *) id;
+     wm = pro->wm;
+ 
+@@ -2184,6 +2514,8 @@ xrdp_mm_drdynvc_up(struct xrdp_mm *self)
  
      LOG_DEVEL(LOG_LEVEL_TRACE, "xrdp_mm_drdynvc_up:");
  
