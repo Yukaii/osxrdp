@@ -1,3 +1,951 @@
+diff --git a/common/ms-rdpbcgr.h b/common/ms-rdpbcgr.h
+index 2669511e..e2fa8b9c 100644
+--- a/common/ms-rdpbcgr.h
++++ b/common/ms-rdpbcgr.h
+@@ -62,10 +62,12 @@
+ #define SEC_TAG_CLI_CHANNELS   0xc003 /* CS_CHANNELS? */
+ #define SEC_TAG_CLI_4          0xc004 /* CS_CLUSTER? */
+ #define SEC_TAG_CLI_MONITOR    0xc005 /* CS_MONITOR */
++#define SEC_TAG_CLI_MSGCHANNEL 0xc006 /* CS_MCS_MSGCHANNEL */
+ #define SEC_TAG_CLI_MONITOR_EX 0xc008 /* CS_MONITOR_EX */
+ #define SEC_TAG_SRV_INFO       0x0c01 /* SC_CORE */
+ #define SEC_TAG_SRV_CRYPT      0x0c02 /* SC_SECURITY */
+ #define SEC_TAG_SRV_CHANNELS   0x0c03 /* SC_NET? */
++#define SEC_TAG_SRV_MSGCHANNEL 0x0c04 /* SC_MCS_MSGCHANNEL */
+ 
+ 
+ /* Client Core Data: colorDepth, postBeta2ColorDepth (2.2.1.3.2) */
+@@ -84,7 +86,9 @@
+ /* Client Core Data: earlyCapabilityFlags (2.2.1.3.2) */
+ #define RNS_UD_CS_WANT_32BPP_SESSION         0x0002
+ #define RNS_UD_CS_SUPPORT_MONITOR_LAYOUT_PDU 0x0040
++#define RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT 0x0080
+ #define RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL 0x0100
++#define RNS_UD_CS_SUPPORT_HEARTBEAT_PDU      0x0400
+ #define RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN   0x0800
+ 
+ /* Client Core Data: connectionType  (2.2.1.3.2) */
+@@ -477,6 +481,23 @@
+ #define SEC_INFO_PKT                   0x0040
+ #define SEC_LICENSE_PKT                0x0080
+ #define SEC_LICENSE_ENCRYPT_CS         0x0280
++#define SEC_AUTODETECT_REQ             0x1000
++#define SEC_AUTODETECT_RSP             0x2000
++#define SEC_HEARTBEAT                  0x4000
++
++/* Auto-Detect Request / Response PDU (2.2.14) */
++#define TYPE_ID_AUTODETECT_REQUEST             0x00
++#define TYPE_ID_AUTODETECT_RESPONSE            0x01
++#define RDP_RTT_REQUEST_TYPE_CONTINUOUS        0x0001
++#define RDP_RTT_RESPONSE_TYPE                  0x0000
++#define RDP_BW_START_REQUEST_TYPE_CONTINUOUS   0x0014
++#define RDP_BW_STOP_REQUEST_TYPE_CONTINUOUS    0x0429
++#define RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME 0x0003
++#define RDP_BW_RESULTS_RESPONSE_TYPE_CONTINUOUS  0x000B
++#define RDP_NETCHAR_SYNC_RESPONSE_TYPE         0x0018
++#define RDP_NETCHAR_RESULT_BASE_RTT_AVG_RTT    0x0840
++#define RDP_NETCHAR_RESULT_BW_AVG_RTT          0x0880
++#define RDP_NETCHAR_RESULT_BASE_RTT_BW_AVG_RTT 0x08C0
+ 
+ /* Slow-Path Input Event: messageType (2.2.8.1.1.3.1.1) */
+ /* TODO: to be renamed */
+diff --git a/libxrdp/Makefile.am b/libxrdp/Makefile.am
+index 8a2c1b76..3ff97358 100644
+--- a/libxrdp/Makefile.am
++++ b/libxrdp/Makefile.am
+@@ -43,6 +43,7 @@ libxrdp_la_SOURCES = \
+   libxrdpinc.h \
+   xrdp_bitmap32_compress.c \
+   xrdp_bitmap_compress.c \
++  xrdp_autodetect.c \
+   xrdp_caps.c \
+   xrdp_channel.c \
+   xrdp_channel.h \
+diff --git a/libxrdp/libxrdp.c b/libxrdp/libxrdp.c
+index 5947e533..62dfd644 100644
+--- a/libxrdp/libxrdp.c
++++ b/libxrdp/libxrdp.c
+@@ -1415,6 +1415,37 @@ libxrdp_send_to_channel(struct xrdp_session *session, int channel_id,
+     return 0;
+ }
+ 
++/*****************************************************************************/
++int
++libxrdp_get_timer_timeout(struct xrdp_session *session, int *timeout)
++{
++    struct xrdp_rdp *rdp;
++
++    if (session == NULL || session->rdp == NULL)
++    {
++        return 0;
++    }
++
++    rdp = (struct xrdp_rdp *)session->rdp;
++    return xrdp_autodetect_get_timeout(rdp->sec_layer->autodetect_layer,
++                                       timeout);
++}
++
++/*****************************************************************************/
++int
++libxrdp_check_timers(struct xrdp_session *session)
++{
++    struct xrdp_rdp *rdp;
++
++    if (session == NULL || session->rdp == NULL)
++    {
++        return 0;
++    }
++
++    rdp = (struct xrdp_rdp *)session->rdp;
++    return xrdp_autodetect_check_timers(rdp->sec_layer->autodetect_layer);
++}
++
+ /*****************************************************************************/
+ int
+ libxrdp_disable_channel(struct xrdp_session *session, int channel_id,
+diff --git a/libxrdp/libxrdp.h b/libxrdp/libxrdp.h
+index b8b60136..ba6e1841 100644
+--- a/libxrdp/libxrdp.h
++++ b/libxrdp/libxrdp.h
+@@ -70,6 +70,10 @@ struct xrdp_mcs
+     /* This boolean is set to indicate we're expecting channel join
+      * requests as part of the connect sequence */
+     int expecting_channel_join_requests;
++    /* [MS-RDPBCGR] 2.2.1.3.7 client requested the MCS message channel */
++    int msgchan_requested;
++    /* MCS message channel id, 0 if not in use */
++    int msgchan_id;
+ };
+ 
+ /* fastpath */
+@@ -133,6 +137,43 @@ struct xrdp_sec
+     void *decrypt_fips_info;
+     void *sign_fips_info;
+     int is_security_header_present; /* boolean */
++    /* TS_SECURITY_HEADER flags of the last received slow-path PDU */
++    int recv_sec_flags;
++    struct xrdp_autodetect *autodetect_layer;
++};
++
++/* [MS-RDPBCGR] 2.2.14 network auto-detection and 2.2.16 heartbeat,
++   both sent over the MCS message channel */
++#define XRDP_AUTODETECT_RTT_SAMPLES 16
++#define XRDP_AUTODETECT_BW_SAMPLES 6
++struct xrdp_autodetect
++{
++    struct xrdp_sec *sec_layer; /* owner */
++    int autodetect_enabled; /* config */
++    int heartbeat_enabled; /* config */
++    int heartbeat_period; /* seconds */
++    int heartbeat_count1;
++    int heartbeat_count2;
++    int sequence_number;
++    /* round-trip time */
++    int rtt_pending;
++    int rtt_sequence_number;
++    int rtt_sent_time;
++    int rtt_samples[XRDP_AUTODETECT_RTT_SAMPLES];
++    int rtt_sample_count;
++    int rtt_sample_index;
++    int average_rtt;
++    /* bandwidth */
++    int bw_measuring;
++    int bw_samples[XRDP_AUTODETECT_BW_SAMPLES]; /* kbit/s */
++    int bw_sample_count;
++    int bw_sample_index;
++    /* timers (g_time3 ms, only valid once timers_started is set) */
++    int timers_started;
++    int next_rtt_time;
++    int next_bw_time;
++    int next_netchar_time;
++    int next_heartbeat_time;
+ };
+ 
+ struct xrdp_drdynvc
+@@ -361,6 +402,19 @@ xrdp_mcs_incoming(struct xrdp_mcs *self);
+ int
+ xrdp_mcs_disconnect(struct xrdp_mcs *self);
+ 
++/* xrdp_autodetect.c */
++struct xrdp_autodetect *
++xrdp_autodetect_create(struct xrdp_sec *owner, const char *xrdp_ini);
++void
++xrdp_autodetect_delete(struct xrdp_autodetect *self);
++int
++xrdp_autodetect_process(struct xrdp_autodetect *self, struct stream *s,
++                        int sec_flags);
++int
++xrdp_autodetect_get_timeout(struct xrdp_autodetect *self, int *timeout);
++int
++xrdp_autodetect_check_timers(struct xrdp_autodetect *self);
++
+ /* xrdp_sec.c */
+ 
+ /*
+diff --git a/libxrdp/libxrdpinc.h b/libxrdp/libxrdpinc.h
+index a14ae3fe..7cbb2dc9 100644
+--- a/libxrdp/libxrdpinc.h
++++ b/libxrdp/libxrdpinc.h
+@@ -241,6 +241,17 @@ int
+ libxrdp_send_to_channel(struct xrdp_session *session, int channel_id,
+                         char *data, int data_len,
+                         int total_data_len, int flags);
++/**
++ * Lowers *timeout (ms, -1 = infinite) so the caller's wait wakes up when
++ * the next periodic PDU (network auto-detection, heartbeat) is due
++ */
++int
++libxrdp_get_timer_timeout(struct xrdp_session *session, int *timeout);
++/**
++ * Sends the periodic PDUs (network auto-detection, heartbeat) that are due
++ */
++int
++libxrdp_check_timers(struct xrdp_session *session);
+ int
+ libxrdp_disable_channel(struct xrdp_session *session, int channel_id,
+                         int is_disabled);
+diff --git a/libxrdp/xrdp_autodetect.c b/libxrdp/xrdp_autodetect.c
+new file mode 100644
+index 00000000..0afcff6a
+--- /dev/null
++++ b/libxrdp/xrdp_autodetect.c
+@@ -0,0 +1,605 @@
++/**
++ * xrdp: A Remote Desktop Protocol server.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Continuous network auto-detection ([MS-RDPBCGR] 2.2.14) and
++ * heartbeat ([MS-RDPBCGR] 2.2.16), sent over the MCS message channel.
++ *
++ * The server periodically measures the round-trip time and the bandwidth
++ * (by bracketing normal traffic with Bandwidth Measure Start / Stop) and
++ * reports the results to the client with Network Characteristics Result
++ * PDUs, which clients show as the connection quality.
++ */
++
++#if defined(HAVE_CONFIG_H)
++#include <config_ac.h>
++#endif
++
++#include "libxrdp.h"
++#include "ms-rdpbcgr.h"
++#include "file.h"
++#include "string_calls.h"
++
++/* all times are in milliseconds */
++#define RTT_INTERVAL         1000
++#define RTT_TIMEOUT          10000
++#define BW_INTERVAL          5000
++#define BW_WINDOW            1000
++#define NETCHAR_INTERVAL     2000
++/* bandwidth samples with less traffic than this measure the idle
++   throughput rather than the available bandwidth, so they are ignored */
++#define BW_MIN_BYTES         (64 * 1024)
++
++/* The client shows a warning after count1 missed heartbeats and starts
++   auto-reconnect after count2. xrdp can block its main loop for a while
++   (e.g. while a module connects), so these are generous */
++#define HEARTBEAT_PERIOD_SEC 5
++#define HEARTBEAT_COUNT1     6
++#define HEARTBEAT_COUNT2     24
++
++/*****************************************************************************/
++static int
++time_diff(int later, int earlier)
++{
++    return (int)((unsigned int)later - (unsigned int)earlier);
++}
++
++/*****************************************************************************/
++static void
++read_config(struct xrdp_autodetect *self, const char *xrdp_ini)
++{
++    struct list *items;
++    struct list *values;
++    int index;
++
++    if (xrdp_ini == NULL)
++    {
++        return;
++    }
++
++    items = list_create();
++    items->auto_free = 1;
++    values = list_create();
++    values->auto_free = 1;
++    file_by_name_read_section(xrdp_ini, "globals", items, values);
++
++    for (index = 0; index < items->count; index++)
++    {
++        const char *item = (const char *)list_get_item(items, index);
++        const char *value = (const char *)list_get_item(values, index);
++
++        if (g_strcasecmp(item, "network_autodetect") == 0)
++        {
++            self->autodetect_enabled = g_text2bool(value);
++        }
++        else if (g_strcasecmp(item, "heartbeat") == 0)
++        {
++            self->heartbeat_enabled = g_text2bool(value);
++        }
++    }
++
++    list_delete(items);
++    list_delete(values);
++}
++
++/*****************************************************************************/
++struct xrdp_autodetect *
++xrdp_autodetect_create(struct xrdp_sec *owner, const char *xrdp_ini)
++{
++    struct xrdp_autodetect *self;
++
++    self = g_new0(struct xrdp_autodetect, 1);
++    if (self == NULL)
++    {
++        return NULL;
++    }
++
++    self->sec_layer = owner;
++    self->autodetect_enabled = 1;
++    self->heartbeat_enabled = 1;
++    self->heartbeat_period = HEARTBEAT_PERIOD_SEC;
++    self->heartbeat_count1 = HEARTBEAT_COUNT1;
++    self->heartbeat_count2 = HEARTBEAT_COUNT2;
++    read_config(self, xrdp_ini);
++
++    return self;
++}
++
++/*****************************************************************************/
++void
++xrdp_autodetect_delete(struct xrdp_autodetect *self)
++{
++    g_free(self);
++}
++
++/*****************************************************************************/
++/* returns boolean */
++static int
++is_session_active(struct xrdp_autodetect *self)
++{
++    struct xrdp_rdp *rdp = self->sec_layer->rdp_layer;
++
++    return self->sec_layer->mcs_layer->msgchan_id != 0 &&
++           rdp->session != NULL && rdp->session->up_and_running;
++}
++
++/*****************************************************************************/
++/* returns boolean */
++static int
++client_supports(struct xrdp_autodetect *self, int early_capability_flag)
++{
++    struct xrdp_client_info *client_info =
++        &(self->sec_layer->rdp_layer->client_info);
++
++    return (client_info->mcs_early_capability_flags & early_capability_flag) != 0;
++}
++
++/*****************************************************************************/
++/* Sends a PDU on the MCS message channel with a basic security header.
++   returns error */
++static int
++send_message_channel_pdu(struct xrdp_autodetect *self, int sec_flags,
++                         const char *data, int data_len)
++{
++    struct xrdp_mcs *mcs = self->sec_layer->mcs_layer;
++    struct stream *s;
++    int rv;
++
++    make_stream(s);
++    init_stream(s, 8192);
++
++    if (xrdp_mcs_init(mcs, s) != 0)
++    {
++        free_stream(s);
++        return 1;
++    }
++
++    /* TS_SECURITY_HEADER */
++    out_uint16_le(s, sec_flags); /* flags */
++    out_uint16_le(s, 0); /* flagsHi */
++    out_uint8a(s, data, data_len);
++    s_mark_end(s);
++
++    rv = xrdp_mcs_send(mcs, s, mcs->msgchan_id);
++    free_stream(s);
++
++    if (rv != 0)
++    {
++        LOG(LOG_LEVEL_ERROR, "xrdp_autodetect: xrdp_mcs_send failed");
++    }
++    return rv;
++}
++
++/*****************************************************************************/
++/* Auto-Detect Request PDU with no extra fields ([MS-RDPBCGR] 2.2.14.1.1,
++   2.2.14.1.2, 2.2.14.1.4). returns error */
++static int
++send_request(struct xrdp_autodetect *self, int request_type,
++             int *out_sequence_number)
++{
++    char pdu[6];
++    int sequence_number = self->sequence_number++ & 0xffff;
++
++    pdu[0] = 0x06; /* headerLength */
++    pdu[1] = TYPE_ID_AUTODETECT_REQUEST; /* headerTypeId */
++    pdu[2] = (char)(sequence_number & 0xff); /* sequenceNumber */
++    pdu[3] = (char)((sequence_number >> 8) & 0xff);
++    pdu[4] = (char)(request_type & 0xff); /* requestType */
++    pdu[5] = (char)((request_type >> 8) & 0xff);
++
++    if (out_sequence_number != NULL)
++    {
++        *out_sequence_number = sequence_number;
++    }
++
++    return send_message_channel_pdu(self, SEC_AUTODETECT_REQ, pdu, sizeof(pdu));
++}
++
++/*****************************************************************************/
++static void
++write_uint32_le(char *p, unsigned int value)
++{
++    p[0] = (char)(value & 0xff);
++    p[1] = (char)((value >> 8) & 0xff);
++    p[2] = (char)((value >> 16) & 0xff);
++    p[3] = (char)((value >> 24) & 0xff);
++}
++
++/*****************************************************************************/
++/* Network Characteristics Result PDU ([MS-RDPBCGR] 2.2.14.1.5)
++   returns error */
++static int
++send_network_characteristics(struct xrdp_autodetect *self)
++{
++    char pdu[18];
++    int len = 6;
++    int request_type;
++    int sequence_number = self->sequence_number++ & 0xffff;
++    int base_rtt = 0;
++    int bandwidth = 0;
++    int index;
++
++    if (self->rtt_sample_count == 0)
++    {
++        return 0;
++    }
++
++    base_rtt = self->rtt_samples[0];
++    for (index = 1; index < self->rtt_sample_count; index++)
++    {
++        if (self->rtt_samples[index] < base_rtt)
++        {
++            base_rtt = self->rtt_samples[index];
++        }
++    }
++
++    /* throughput samples underestimate the available bandwidth, so report
++       the best recent one */
++    for (index = 0; index < self->bw_sample_count; index++)
++    {
++        if (self->bw_samples[index] > bandwidth)
++        {
++            bandwidth = self->bw_samples[index];
++        }
++    }
++
++    request_type = bandwidth > 0 ? RDP_NETCHAR_RESULT_BASE_RTT_BW_AVG_RTT
++                   : RDP_NETCHAR_RESULT_BASE_RTT_AVG_RTT;
++
++    write_uint32_le(pdu + len, base_rtt); /* baseRTT */
++    len += 4;
++    if (bandwidth > 0)
++    {
++        write_uint32_le(pdu + len, bandwidth); /* bandwidth (kbit/s) */
++        len += 4;
++    }
++    write_uint32_le(pdu + len, self->average_rtt); /* averageRTT */
++    len += 4;
++
++    pdu[0] = (char)len; /* headerLength */
++    pdu[1] = TYPE_ID_AUTODETECT_REQUEST; /* headerTypeId */
++    pdu[2] = (char)(sequence_number & 0xff); /* sequenceNumber */
++    pdu[3] = (char)((sequence_number >> 8) & 0xff);
++    pdu[4] = (char)(request_type & 0xff); /* requestType */
++    pdu[5] = (char)((request_type >> 8) & 0xff);
++
++    LOG_DEVEL(LOG_LEVEL_DEBUG, "xrdp_autodetect: baseRTT %d averageRTT %d "
++              "bandwidth %d kbit/s", base_rtt, self->average_rtt, bandwidth);
++
++    return send_message_channel_pdu(self, SEC_AUTODETECT_REQ, pdu, len);
++}
++
++/*****************************************************************************/
++/* Heartbeat PDU ([MS-RDPBCGR] 2.2.16.1) returns error */
++static int
++send_heartbeat(struct xrdp_autodetect *self)
++{
++    char pdu[4];
++
++    pdu[0] = 0; /* reserved */
++    pdu[1] = (char)self->heartbeat_period; /* period */
++    pdu[2] = (char)self->heartbeat_count1; /* count1 */
++    pdu[3] = (char)self->heartbeat_count2; /* count2 */
++
++    return send_message_channel_pdu(self, SEC_HEARTBEAT, pdu, sizeof(pdu));
++}
++
++/*****************************************************************************/
++static void
++add_rtt_sample(struct xrdp_autodetect *self, int rtt)
++{
++    if (rtt < 0)
++    {
++        return;
++    }
++
++    self->rtt_samples[self->rtt_sample_index] = rtt;
++    self->rtt_sample_index =
++        (self->rtt_sample_index + 1) % XRDP_AUTODETECT_RTT_SAMPLES;
++    if (self->rtt_sample_count < XRDP_AUTODETECT_RTT_SAMPLES)
++    {
++        self->rtt_sample_count++;
++    }
++
++    if (self->rtt_sample_count == 1)
++    {
++        self->average_rtt = rtt;
++    }
++    else
++    {
++        self->average_rtt = (self->average_rtt * 7 + rtt) / 8;
++    }
++}
++
++/*****************************************************************************/
++static void
++add_bw_sample(struct xrdp_autodetect *self, int kbps)
++{
++    if (kbps <= 0)
++    {
++        return;
++    }
++
++    self->bw_samples[self->bw_sample_index] = kbps;
++    self->bw_sample_index =
++        (self->bw_sample_index + 1) % XRDP_AUTODETECT_BW_SAMPLES;
++    if (self->bw_sample_count < XRDP_AUTODETECT_BW_SAMPLES)
++    {
++        self->bw_sample_count++;
++    }
++}
++
++/*****************************************************************************/
++/* Processes a PDU received on the MCS message channel.
++   returns error */
++int
++xrdp_autodetect_process(struct xrdp_autodetect *self, struct stream *s,
++                        int sec_flags)
++{
++    int header_length;
++    int header_type_id;
++    int sequence_number;
++    int response_type;
++    unsigned int time_delta;
++    unsigned int byte_count;
++    unsigned int bandwidth;
++    unsigned int rtt;
++
++    if (self == NULL)
++    {
++        return 1;
++    }
++
++    if ((sec_flags & SEC_AUTODETECT_RSP) == 0)
++    {
++        LOG_DEVEL(LOG_LEVEL_DEBUG, "xrdp_autodetect: ignoring message "
++                  "channel PDU with flags 0x%4.4x", sec_flags);
++        return 0;
++    }
++
++    /* [MS-RDPBCGR] 2.2.14.2 AUTODETECT_RSP_PDU */
++    if (!s_check_rem_and_log(s, 6, "Parsing [MS-RDPBCGR] AUTODETECT_RSP_PDU"))
++    {
++        return 1;
++    }
++    in_uint8(s, header_length);
++    in_uint8(s, header_type_id);
++    in_uint16_le(s, sequence_number);
++    in_uint16_le(s, response_type);
++
++    if (header_type_id != TYPE_ID_AUTODETECT_RESPONSE)
++    {
++        return 0;
++    }
++
++    switch (response_type)
++    {
++        case RDP_RTT_RESPONSE_TYPE:
++            if (self->rtt_pending &&
++                    sequence_number == self->rtt_sequence_number)
++            {
++                add_rtt_sample(self, time_diff(g_time3(), self->rtt_sent_time));
++                self->rtt_pending = 0;
++            }
++            break;
++
++        case RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME:
++        case RDP_BW_RESULTS_RESPONSE_TYPE_CONTINUOUS:
++            if (header_length < 0x0E ||
++                    !s_check_rem_and_log(s, 8, "Parsing [MS-RDPBCGR] "
++                                         "Bandwidth Measure Results"))
++            {
++                return 1;
++            }
++            in_uint32_le(s, time_delta);
++            in_uint32_le(s, byte_count);
++            if (time_delta > 0 && byte_count >= BW_MIN_BYTES)
++            {
++                /* bytes per ms * 8 = kbit/s */
++                add_bw_sample(self, (int)MIN((unsigned long long)byte_count * 8 / time_delta,
++                                             0x7fffffffULL));
++            }
++            break;
++
++        case RDP_NETCHAR_SYNC_RESPONSE_TYPE:
++            /* [MS-RDPBCGR] 2.2.14.2.3 values cached by the client from an
++               earlier connection, used until we have our own */
++            if (header_length < 0x0E ||
++                    !s_check_rem_and_log(s, 8, "Parsing [MS-RDPBCGR] "
++                                         "Network Characteristics Sync"))
++            {
++                return 1;
++            }
++            in_uint32_le(s, bandwidth);
++            in_uint32_le(s, rtt);
++            if (self->bw_sample_count == 0)
++            {
++                add_bw_sample(self, (int)MIN(bandwidth, 0x7fffffffU));
++            }
++            if (self->rtt_sample_count == 0)
++            {
++                add_rtt_sample(self, (int)MIN(rtt, 0x7fffffffU));
++            }
++            break;
++
++        default:
++            LOG_DEVEL(LOG_LEVEL_DEBUG, "xrdp_autodetect: ignoring response "
++                      "type 0x%4.4x", response_type);
++            break;
++    }
++
++    return 0;
++}
++
++/*****************************************************************************/
++/* returns boolean */
++static int
++autodetect_active(struct xrdp_autodetect *self)
++{
++    return self->autodetect_enabled &&
++           client_supports(self, RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT);
++}
++
++/*****************************************************************************/
++/* returns boolean */
++static int
++heartbeat_active(struct xrdp_autodetect *self)
++{
++    return self->heartbeat_enabled &&
++           client_supports(self, RNS_UD_CS_SUPPORT_HEARTBEAT_PDU);
++}
++
++/*****************************************************************************/
++static void
++update_timeout(int now, int due, int *timeout)
++{
++    int wait = time_diff(due, now);
++
++    if (wait < 0)
++    {
++        wait = 0;
++    }
++    if (*timeout < 0 || wait < *timeout)
++    {
++        *timeout = wait;
++    }
++}
++
++/*****************************************************************************/
++/* Lowers *timeout (ms, -1 = infinite) so the main loop wakes up when the
++   next PDU is due. returns error */
++int
++xrdp_autodetect_get_timeout(struct xrdp_autodetect *self, int *timeout)
++{
++    int now;
++
++    if (self == NULL || timeout == NULL || !is_session_active(self))
++    {
++        return 0;
++    }
++
++    if (!self->timers_started)
++    {
++        /* started by the next xrdp_autodetect_check_timers() */
++        *timeout = 0;
++        return 0;
++    }
++
++    now = g_time3();
++
++    if (autodetect_active(self))
++    {
++        update_timeout(now, self->next_rtt_time, timeout);
++        update_timeout(now, self->next_bw_time, timeout);
++        update_timeout(now, self->next_netchar_time, timeout);
++    }
++
++    if (heartbeat_active(self))
++    {
++        update_timeout(now, self->next_heartbeat_time, timeout);
++    }
++
++    return 0;
++}
++
++/*****************************************************************************/
++/* Sends any auto-detect / heartbeat PDUs that are due. returns error */
++int
++xrdp_autodetect_check_timers(struct xrdp_autodetect *self)
++{
++    int now;
++
++    if (self == NULL || !is_session_active(self))
++    {
++        return 0;
++    }
++
++    now = g_time3();
++
++    if (!self->timers_started)
++    {
++        /* g_time3() is wall clock time truncated to an int, so it can be
++           any value. Start every timer relative to now */
++        self->timers_started = 1;
++        self->next_heartbeat_time = now;
++        self->next_rtt_time = now;
++        self->next_bw_time = now + BW_INTERVAL;
++        self->next_netchar_time = now + NETCHAR_INTERVAL;
++    }
++
++    if (heartbeat_active(self) && time_diff(now, self->next_heartbeat_time) >= 0)
++    {
++        if (send_heartbeat(self) != 0)
++        {
++            return 1;
++        }
++        self->next_heartbeat_time = now + self->heartbeat_period * 1000;
++    }
++
++    if (!autodetect_active(self))
++    {
++        return 0;
++    }
++
++    if (time_diff(now, self->next_rtt_time) >= 0)
++    {
++        /* a lost response must not stop the measurements */
++        if (!self->rtt_pending ||
++                time_diff(now, self->rtt_sent_time) > RTT_TIMEOUT)
++        {
++            if (send_request(self, RDP_RTT_REQUEST_TYPE_CONTINUOUS,
++                             &self->rtt_sequence_number) != 0)
++            {
++                return 1;
++            }
++            self->rtt_pending = 1;
++            self->rtt_sent_time = now;
++        }
++        self->next_rtt_time = now + RTT_INTERVAL;
++    }
++
++    if (time_diff(now, self->next_bw_time) >= 0)
++    {
++        /* the client counts every byte it receives between Start and Stop
++           and replies with Bandwidth Measure Results */
++        if (send_request(self, self->bw_measuring
++                         ? RDP_BW_STOP_REQUEST_TYPE_CONTINUOUS
++                         : RDP_BW_START_REQUEST_TYPE_CONTINUOUS, NULL) != 0)
++        {
++            return 1;
++        }
++
++        if (self->bw_measuring)
++        {
++            self->bw_measuring = 0;
++            self->next_bw_time = now + BW_INTERVAL;
++        }
++        else
++        {
++            self->bw_measuring = 1;
++            self->next_bw_time = now + BW_WINDOW;
++        }
++    }
++
++    if (time_diff(now, self->next_netchar_time) >= 0)
++    {
++        if (send_network_characteristics(self) != 0)
++        {
++            return 1;
++        }
++        self->next_netchar_time = now + NETCHAR_INTERVAL;
++    }
++
++    return 0;
++}
+diff --git a/libxrdp/xrdp_mcs.c b/libxrdp/xrdp_mcs.c
+index a49eb120..dabf142d 100644
+--- a/libxrdp/xrdp_mcs.c
++++ b/libxrdp/xrdp_mcs.c
+@@ -1040,6 +1040,27 @@ xrdp_mcs_out_gcc_data(struct xrdp_sec *self)
+             "will not be sent a [MS-RDPBCGR] TS_UD_SC_SEC1 message.",
+             self->rsa_key_bytes);
+     }
++    /* [MS-RDPBCGR] 2.2.1.4.5 Server Message Channel Data.
++       Only offered without RDP encryption (TLS), as message channel PDUs
++       are sent with a basic security header */
++    if (self->mcs_layer->msgchan_requested &&
++            self->crypt_level == CRYPT_LEVEL_NONE)
++    {
++        /* the user channel normally takes the id after the static
++           virtual channels (see xrdp_sec_process_mcs_data_channels) */
++        self->mcs_layer->msgchan_id = MCS_GLOBAL_CHANNEL + num_channels + 1;
++        if (self->mcs_layer->msgchan_id <= self->mcs_layer->chanid)
++        {
++            self->mcs_layer->msgchan_id = self->mcs_layer->chanid + 1;
++        }
++        out_uint16_le(s, SEC_TAG_SRV_MSGCHANNEL); /* type */
++        out_uint16_le(s, 6); /* length */
++        out_uint16_le(s, self->mcs_layer->msgchan_id); /* MCSChannelId */
++        LOG_DEVEL(LOG_LEVEL_TRACE, "Adding struct [MS-RDPBCGR] "
++                  "TS_UD_SC_MCS_MSGCHANNEL MCSChannelId %d",
++                  self->mcs_layer->msgchan_id);
++    }
++
+     s_mark_end(s);
+ 
+     gcc_size = (int)(s->end - ud_ptr) | 0x8000;
+@@ -1141,6 +1162,10 @@ handle_channel_join_requests(struct xrdp_mcs *self,
+          * virtual channels, plus the user channel (self->chanid) and
+          * the I/O channel (MCS_GLOBAL_CHANNEL) */
+         expected_join_count = self->channel_list->count + 2;
++        if (self->msgchan_id != 0)
++        {
++            ++expected_join_count;
++        }
+     }
+ 
+     unsigned int actual_join_count = 0;
+diff --git a/libxrdp/xrdp_rdp.c b/libxrdp/xrdp_rdp.c
+index 34d8cfc8..eff404b9 100644
+--- a/libxrdp/xrdp_rdp.c
++++ b/libxrdp/xrdp_rdp.c
+@@ -505,6 +505,28 @@ xrdp_rdp_recv(struct xrdp_rdp *self, struct stream *s, int *code)
+             return 1;
+         }
+ 
++        if (chan > 0 && chan == self->sec_layer->mcs_layer->msgchan_id)
++        {
++            /* [MS-RDPBCGR] message channel PDUs always carry a security
++               header, even when it is otherwise absent (TLS) */
++            int sec_flags = self->sec_layer->recv_sec_flags;
++            if (!self->sec_layer->is_security_header_present)
++            {
++                if (!s_check_rem_and_log(s, 4, "Parsing [MS-RDPBCGR] "
++                                         "message channel TS_SECURITY_HEADER"))
++                {
++                    return 1;
++                }
++                in_uint16_le(s, sec_flags);
++                in_uint8s(s, 2); /* flagsHi */
++            }
++            xrdp_autodetect_process(self->sec_layer->autodetect_layer, s,
++                                    sec_flags);
++            s->next_packet = 0;
++            *code = 0;
++            return 0;
++        }
++
+         if ((chan != MCS_GLOBAL_CHANNEL) && (chan > 0))
+         {
+             if (chan > MCS_GLOBAL_CHANNEL)
+diff --git a/libxrdp/xrdp_sec.c b/libxrdp/xrdp_sec.c
+index 83467f3d..67b6b7a1 100644
+--- a/libxrdp/xrdp_sec.c
++++ b/libxrdp/xrdp_sec.c
+@@ -432,6 +432,8 @@ xrdp_sec_create(struct xrdp_rdp *owner, struct trans *trans)
+     self->fastpath_layer = xrdp_fastpath_create(self, trans);
+     self->chan_layer = xrdp_channel_create(self, self->mcs_layer);
+     self->is_security_header_present = 1;
++    self->autodetect_layer = xrdp_autodetect_create(self,
++                             owner->session->xrdp_ini);
+ 
+     return self;
+ }
+@@ -445,6 +447,7 @@ xrdp_sec_delete(struct xrdp_sec *self)
+         return;
+     }
+ 
++    xrdp_autodetect_delete(self->autodetect_layer);
+     xrdp_channel_delete(self->chan_layer);
+     xrdp_mcs_delete(self->mcs_layer);
+     xrdp_fastpath_delete(self->fastpath_layer);
+@@ -1504,6 +1507,8 @@ xrdp_sec_recv(struct xrdp_sec *self, struct stream *s, int *chan)
+     int ver;
+     int pad;
+ 
++    self->recv_sec_flags = 0;
++
+     if (xrdp_mcs_recv(self->mcs_layer, s, chan) != 0)
+     {
+         LOG(LOG_LEVEL_ERROR, "xrdp_sec_recv: xrdp_mcs_recv failed");
+@@ -1533,6 +1538,7 @@ xrdp_sec_recv(struct xrdp_sec *self, struct stream *s, int *chan)
+     in_uint32_le(s, flags);
+     LOG_DEVEL(LOG_LEVEL_TRACE, "Received header [MS-RDPBCGR] TS_SECURITY_HEADER "
+               "flags 0x%8.8x, flagsHi (merged with flags)", flags);
++    self->recv_sec_flags = flags;
+ 
+     if (flags & SEC_ENCRYPT) /* 0x08 */
+     {
+@@ -2545,8 +2551,14 @@ xrdp_sec_process_mcs_data(struct xrdp_sec *self)
+                     return 1;
+                 }
+                 break;
+-            /* CS_MCS_MSGCHANNEL 0xC006
+-               CS_MULTITRANSPORT 0xC00A
++            case SEC_TAG_CLI_MSGCHANNEL: /* CS_MCS_MSGCHANNEL 0xC006 */
++                /* flags (4 bytes) are unused. The channel is allocated
++                   when the server data blocks are written */
++                self->mcs_layer->msgchan_requested = 1;
++                LOG_DEVEL(LOG_LEVEL_TRACE,
++                          "Received [MS-RDPBCGR] TS_UD_CS_MCS_MSGCHANNEL");
++                break;
++            /* CS_MULTITRANSPORT 0xC00A
+                SC_CORE           0x0C01
+                SC_SECURITY       0x0C02
+                SC_NET            0x0C03
 diff --git a/xrdp/xrdp_encoder_openh264.c b/xrdp/xrdp_encoder_openh264.c
 index f3fda5ed..315aa8c8 100644
 --- a/xrdp/xrdp_encoder_openh264.c
@@ -23,3 +971,441 @@ index f3fda5ed..315aa8c8 100644
                  status = ENC_INITIALIZE_EXT(
                               oe->openh264_enc_han, &encParamExt);
                  LOG(LOG_LEVEL_INFO, "xrdp_encoder_openh264_encode: "
+diff --git a/xrdp/xrdp_mm.c b/xrdp/xrdp_mm.c
+index 2a6a3009..5d8038ae 100644
+--- a/xrdp/xrdp_mm.c
++++ b/xrdp/xrdp_mm.c
+@@ -133,6 +133,315 @@ xrdp_mm_sync_load(long param1, long param2)
+     return rv;
+ }
+ 
++/*****************************************************************************/
++/* Maximum size of a reassembled message on a module dynamic virtual channel */
++#define MOD_DVC_MAX_MESSAGE_BYTES (4 * 1024 * 1024)
++
++/*****************************************************************************/
++static struct xrdp_mm *
++xrdp_mm_from_process_id(intptr_t id)
++{
++    struct xrdp_process *pro = (struct xrdp_process *)id;
++
++    if (pro == NULL || pro->wm == NULL)
++    {
++        return NULL;
++    }
++    return pro->wm->mm;
++}
++
++/*****************************************************************************/
++static struct xrdp_mm_mod_dvc *
++xrdp_mm_get_mod_dvc(struct xrdp_mm *self, int chan_id)
++{
++    if (self == NULL || chan_id < 1 || chan_id > 255)
++    {
++        return NULL;
++    }
++    return self->mod_dvcs[chan_id];
++}
++
++/*****************************************************************************/
++static void
++xrdp_mm_free_mod_dvc(struct xrdp_mm *self, int chan_id)
++{
++    struct xrdp_mm_mod_dvc *dvc = xrdp_mm_get_mod_dvc(self, chan_id);
++
++    if (dvc != NULL)
++    {
++        g_free(dvc->rx_data);
++        g_free(dvc);
++        self->mod_dvcs[chan_id] = NULL;
++    }
++}
++
++/*****************************************************************************/
++/* Closes the dynamic virtual channels of a module that is going away */
++static void
++xrdp_mm_close_mod_dvcs(struct xrdp_mm *self)
++{
++    int chan_id;
++
++    for (chan_id = 1; chan_id < 256; chan_id++)
++    {
++        if (self->mod_dvcs[chan_id] != NULL)
++        {
++            libxrdp_drdynvc_close(self->wm->session, chan_id);
++            xrdp_mm_free_mod_dvc(self, chan_id);
++        }
++    }
++}
++
++/*****************************************************************************/
++static void
++xrdp_mm_mod_dvc_deliver(struct xrdp_mm *self, int chan_id,
++                        char *data, int bytes)
++{
++    if (self->mod != NULL && self->mod->mod_drdynvc_data != NULL)
++    {
++        self->mod->mod_drdynvc_data(self->mod, chan_id, data, bytes);
++    }
++}
++
++/*****************************************************************************/
++/* open response from client going to the module */
++static int
++xrdp_mm_mod_drdynvc_open_response(intptr_t id, int chan_id,
++                                  int creation_status)
++{
++    struct xrdp_mm *self = xrdp_mm_from_process_id(id);
++
++    if (xrdp_mm_get_mod_dvc(self, chan_id) == NULL)
++    {
++        return 0;
++    }
++
++    if (self->mod != NULL && self->mod->mod_drdynvc_open_response != NULL)
++    {
++        self->mod->mod_drdynvc_open_response(self->mod, chan_id,
++                                             creation_status);
++    }
++
++    if (creation_status < 0)
++    {
++        /* the client refused to open the channel */
++        xrdp_mm_free_mod_dvc(self, chan_id);
++    }
++    return 0;
++}
++
++/*****************************************************************************/
++/* close response from client going to the module */
++static int
++xrdp_mm_mod_drdynvc_close_response(intptr_t id, int chan_id)
++{
++    struct xrdp_mm *self = xrdp_mm_from_process_id(id);
++
++    if (xrdp_mm_get_mod_dvc(self, chan_id) == NULL)
++    {
++        return 0;
++    }
++
++    if (self->mod != NULL && self->mod->mod_drdynvc_close_response != NULL)
++    {
++        self->mod->mod_drdynvc_close_response(self->mod, chan_id);
++    }
++
++    xrdp_mm_free_mod_dvc(self, chan_id);
++    return 0;
++}
++
++/*****************************************************************************/
++/* first fragment of a message from client going to the module */
++static int
++xrdp_mm_mod_drdynvc_data_first(intptr_t id, int chan_id, char *data,
++                               int bytes, int total_bytes)
++{
++    struct xrdp_mm *self = xrdp_mm_from_process_id(id);
++    struct xrdp_mm_mod_dvc *dvc = xrdp_mm_get_mod_dvc(self, chan_id);
++
++    if (dvc == NULL)
++    {
++        return 0;
++    }
++
++    g_free(dvc->rx_data);
++    dvc->rx_data = NULL;
++    dvc->rx_bytes = 0;
++    dvc->rx_total_bytes = 0;
++
++    if (bytes < 0 || total_bytes < bytes ||
++            total_bytes > MOD_DVC_MAX_MESSAGE_BYTES)
++    {
++        LOG(LOG_LEVEL_ERROR, "xrdp_mm_mod_drdynvc_data_first: bad message "
++            "size %d / %d on channel %d", bytes, total_bytes, chan_id);
++        return 0;
++    }
++
++    if (bytes == total_bytes)
++    {
++        xrdp_mm_mod_dvc_deliver(self, chan_id, data, bytes);
++        return 0;
++    }
++
++    dvc->rx_data = g_new(char, total_bytes);
++    if (dvc->rx_data == NULL)
++    {
++        return 1;
++    }
++    g_memcpy(dvc->rx_data, data, bytes);
++    dvc->rx_bytes = bytes;
++    dvc->rx_total_bytes = total_bytes;
++    return 0;
++}
++
++/*****************************************************************************/
++/* message (or following fragment) from client going to the module */
++static int
++xrdp_mm_mod_drdynvc_data(intptr_t id, int chan_id, char *data, int bytes)
++{
++    struct xrdp_mm *self = xrdp_mm_from_process_id(id);
++    struct xrdp_mm_mod_dvc *dvc = xrdp_mm_get_mod_dvc(self, chan_id);
++
++    if (dvc == NULL || bytes < 0)
++    {
++        return 0;
++    }
++
++    if (dvc->rx_data == NULL)
++    {
++        /* complete message */
++        xrdp_mm_mod_dvc_deliver(self, chan_id, data, bytes);
++        return 0;
++    }
++
++    if (bytes > dvc->rx_total_bytes - dvc->rx_bytes)
++    {
++        LOG(LOG_LEVEL_ERROR, "xrdp_mm_mod_drdynvc_data: fragment overflows "
++            "message on channel %d", chan_id);
++        g_free(dvc->rx_data);
++        dvc->rx_data = NULL;
++        return 0;
++    }
++
++    g_memcpy(dvc->rx_data + dvc->rx_bytes, data, bytes);
++    dvc->rx_bytes += bytes;
++
++    if (dvc->rx_bytes == dvc->rx_total_bytes)
++    {
++        char *message = dvc->rx_data;
++        int message_bytes = dvc->rx_bytes;
++
++        dvc->rx_data = NULL;
++        dvc->rx_bytes = 0;
++        dvc->rx_total_bytes = 0;
++        xrdp_mm_mod_dvc_deliver(self, chan_id, message, message_bytes);
++        g_free(message);
++    }
++    return 0;
++}
++
++/*****************************************************************************/
++static int
++server_drdynvc_open(struct xrdp_mod *mod, const char *name, int flags,
++                    int *chan_id)
++{
++    struct xrdp_wm *wm = (struct xrdp_wm *)(mod->wm);
++    struct xrdp_mm *self = wm->mm;
++    struct xrdp_drdynvc_procs procs;
++    int id = 0;
++
++    if (name == NULL || chan_id == NULL)
++    {
++        return 1;
++    }
++
++    if (!self->drdynvc_up)
++    {
++        return 2;
++    }
++
++    g_memset(&procs, 0, sizeof(procs));
++    procs.open_response = xrdp_mm_mod_drdynvc_open_response;
++    procs.close_response = xrdp_mm_mod_drdynvc_close_response;
++    procs.data_first = xrdp_mm_mod_drdynvc_data_first;
++    procs.data = xrdp_mm_mod_drdynvc_data;
++
++    if (libxrdp_drdynvc_open(wm->session, name, flags, &procs, &id) != 0 ||
++            id < 1 || id > 255)
++    {
++        LOG(LOG_LEVEL_ERROR, "server_drdynvc_open: could not open %s", name);
++        return 1;
++    }
++
++    xrdp_mm_free_mod_dvc(self, id);
++    self->mod_dvcs[id] = g_new0(struct xrdp_mm_mod_dvc, 1);
++    if (self->mod_dvcs[id] == NULL)
++    {
++        libxrdp_drdynvc_close(wm->session, id);
++        return 1;
++    }
++
++    *chan_id = id;
++    return 0;
++}
++
++/*****************************************************************************/
++static int
++server_drdynvc_close(struct xrdp_mod *mod, int chan_id)
++{
++    struct xrdp_wm *wm = (struct xrdp_wm *)(mod->wm);
++
++    if (xrdp_mm_get_mod_dvc(wm->mm, chan_id) == NULL)
++    {
++        return 1;
++    }
++
++    /* the entry is freed when the client confirms the close */
++    return libxrdp_drdynvc_close(wm->session, chan_id);
++}
++
++/*****************************************************************************/
++static int
++server_drdynvc_send(struct xrdp_mod *mod, int chan_id,
++                    const char *data, int data_bytes)
++{
++    /* [MS-RDPEDYC] maximum data per DYNVC_DATA_FIRST / DYNVC_DATA PDU as
++       accepted by libxrdp */
++    const int max_fragment = 1590;
++    struct xrdp_wm *wm = (struct xrdp_wm *)(mod->wm);
++    int offset;
++    int bytes;
++
++    if (xrdp_mm_get_mod_dvc(wm->mm, chan_id) == NULL ||
++            data == NULL || data_bytes <= 0)
++    {
++        return 1;
++    }
++
++    if (data_bytes <= max_fragment)
++    {
++        return libxrdp_drdynvc_data(wm->session, chan_id, data, data_bytes);
++    }
++
++    if (libxrdp_drdynvc_data_first(wm->session, chan_id, data, max_fragment,
++                                   data_bytes) != 0)
++    {
++        return 1;
++    }
++
++    for (offset = max_fragment; offset < data_bytes; offset += bytes)
++    {
++        bytes = MIN(data_bytes - offset, max_fragment);
++        if (libxrdp_drdynvc_data(wm->session, chan_id, data + offset,
++                                 bytes) != 0)
++        {
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ /*****************************************************************************/
+ static void
+ xrdp_mm_module_cleanup(struct xrdp_mm *self)
+@@ -148,6 +457,9 @@ xrdp_mm_module_cleanup(struct xrdp_mm *self)
+         }
+     }
+ 
++    /* the module can no longer receive channel events */
++    xrdp_mm_close_mod_dvcs(self);
++
+     if (self->mod_handle != 0)
+     {
+         /* Let the main thread unload the module.*/
+@@ -463,6 +775,9 @@ xrdp_mm_setup_mod1(struct xrdp_mm *self)
+             self->mod->server_paint_rects_ex = server_paint_rects_ex;
+             self->mod->server_set_pointer_system = server_set_pointer_system;
+             self->mod->server_set_pointer_position = server_set_pointer_position;
++            self->mod->server_drdynvc_open = server_drdynvc_open;
++            self->mod->server_drdynvc_close = server_drdynvc_close;
++            self->mod->server_drdynvc_send = server_drdynvc_send;
+             self->mod->si = &(self->wm->session->si);
+         }
+     }
+@@ -2184,6 +2499,8 @@ xrdp_mm_drdynvc_up(struct xrdp_mm *self)
+ 
+     LOG_DEVEL(LOG_LEVEL_TRACE, "xrdp_mm_drdynvc_up:");
+ 
++    self->drdynvc_up = 1;
++
+     error = egfx_initialize(self);
+     if (error != 0)
+     {
+diff --git a/xrdp/xrdp_process.c b/xrdp/xrdp_process.c
+index c40613dc..115a5214 100644
+--- a/xrdp/xrdp_process.c
++++ b/xrdp/xrdp_process.c
+@@ -264,6 +264,7 @@ xrdp_process_main_loop(struct xrdp_process *self)
+                                   wobjs, &wobjs_count, &timeout);
+             trans_get_wait_objs_rw(self->server_trans, robjs, &robjs_count,
+                                    wobjs, &wobjs_count, &timeout);
++            libxrdp_get_timer_timeout(self->session, &timeout);
+             /* wait */
+             if (g_obj_wait(robjs, robjs_count, wobjs, wobjs_count, timeout) != 0)
+             {
+@@ -293,6 +294,11 @@ xrdp_process_main_loop(struct xrdp_process *self)
+             {
+                 break;
+             }
++
++            if (libxrdp_check_timers(self->session) != 0)
++            {
++                break;
++            }
+         }
+         /* send disconnect message if possible */
+         libxrdp_disconnect(self->session);
+diff --git a/xrdp/xrdp_types.h b/xrdp/xrdp_types.h
+index 49c33096..4d993134 100644
+--- a/xrdp/xrdp_types.h
++++ b/xrdp/xrdp_types.h
+@@ -75,7 +75,15 @@ struct xrdp_mod
+     int (*mod_server_monitor_full_invalidate)(struct xrdp_mod *v,
+             int width, int height);
+     int (*mod_server_version_message)(struct xrdp_mod *v);
+-    tintptr mod_dumby[100 - 14]; /* align, 100 minus the number of mod
++    /* dynamic virtual channels opened with server_drdynvc_open().
++       Optional, may be NULL. mod_drdynvc_data() receives complete
++       (reassembled) messages */
++    int (*mod_drdynvc_open_response)(struct xrdp_mod *v, int chan_id,
++                                     int creation_status);
++    int (*mod_drdynvc_close_response)(struct xrdp_mod *v, int chan_id);
++    int (*mod_drdynvc_data)(struct xrdp_mod *v, int chan_id,
++                            char *data, int data_bytes);
++    tintptr mod_dumby[100 - 17]; /* align, 100 minus the number of mod
+                                   functions above */
+     /* server functions */
+     int (*server_begin_update)(struct xrdp_mod *v);
+@@ -197,7 +205,15 @@ struct xrdp_mod
+                            char *data, int data_bytes);
+     int (*server_set_pointer_system)(struct xrdp_mod *v, int pointer_type);
+     int (*server_set_pointer_position)(struct xrdp_mod *v, int x, int y);
+-    tintptr server_dumby[100 - 52]; /* align, 100 minus the number of server
++    /* returns 0 on success, 1 on error, 2 if the client has not set up
++       dynamic virtual channels yet (try again later) */
++    int (*server_drdynvc_open)(struct xrdp_mod *v, const char *name,
++                               int flags, int *chan_id);
++    int (*server_drdynvc_close)(struct xrdp_mod *v, int chan_id);
++    /* sends one message, fragmented as needed */
++    int (*server_drdynvc_send)(struct xrdp_mod *v, int chan_id,
++                               const char *data, int data_bytes);
++    tintptr server_dumby[100 - 55]; /* align, 100 minus the number of server
+                                      functions above */
+     /* common */
+     tintptr handle; /* pointer to self as int */
+@@ -407,6 +423,15 @@ enum xrdp_egfx_flags
+     XRDP_EGFX_RFX_PRO = 2
+ };
+ 
++/* dynamic virtual channel opened by the module */
++struct xrdp_mm_mod_dvc
++{
++    /* reassembly of DYNVC_DATA_FIRST / DYNVC_DATA fragments */
++    char *rx_data;
++    int rx_bytes;
++    int rx_total_bytes;
++};
++
+ struct xrdp_mm
+ {
+     struct xrdp_wm *wm; /* owner */
+@@ -456,6 +481,10 @@ struct xrdp_mm
+     /* wait obj for resize_queue
+      * Only allocated when the queue can be processed */
+     tbus resize_ready;
++    /* dynamic virtual channels are up (capabilities exchanged) */
++    int drdynvc_up;
++    /* dynamic virtual channels owned by the module, indexed by chan_id */
++    struct xrdp_mm_mod_dvc *mod_dvcs[256];
+ };
+ 
+ struct xrdp_key_info

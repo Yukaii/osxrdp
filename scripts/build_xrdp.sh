@@ -154,18 +154,18 @@ build_xrdp() {
     local build="$WORK_DIR/build-xrdp-$arch"
 
     log "Building xrdp ($arch)"
-    # xrdp 와 keygen 은 X11 을 사용하지 않지만 configure 가 항상 X11 을 찾으므로 빈 경로를 지정
-    mkdir -p "$WORK_DIR/no-x11"
     rm -rf "$build"
     cp -R "$WORK_DIR/xrdp-patched" "$build"
 
     (
         cd "$build"
+        # xrdp 와 keygen 은 X11 을 사용하지 않지만 configure 가 항상 X11 을 찾으므로
+        # 빈 경로(/var/empty)를 지정하고 X11 extension header 검사는 건너뛴다.
         ./configure \
             --host="$(host_triple "$arch")" \
             --prefix=/usr/local --sysconfdir=/etc --localstatedir=/var \
             --enable-openh264 --enable-static --disable-shared --enable-ipv6 \
-            --x-includes="$WORK_DIR/no-x11" --x-libraries="$WORK_DIR/no-x11" \
+            --x-includes=/var/empty --x-libraries=/var/empty \
             ac_cv_header_X11_extensions_Xfixes_h=yes \
             ac_cv_header_X11_extensions_Xrandr_h=yes \
             CC="$TOOLCHAIN_CC -arch $arch" \
