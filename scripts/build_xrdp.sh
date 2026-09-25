@@ -139,7 +139,7 @@ prepare_xrdp_source() {
 
     log "Preparing patched xrdp source"
     rm -rf "$tree"
-    cp -R "$SRC_DIR/xrdp" "$tree"
+    cp -Rp "$SRC_DIR/xrdp" "$tree"
 
     (
         cd "$tree"
@@ -155,7 +155,8 @@ build_xrdp() {
 
     log "Building xrdp ($arch)"
     rm -rf "$build"
-    cp -R "$WORK_DIR/xrdp-patched" "$build"
+    # 시간 정보를 유지해야 make 가 automake/configure 를 (병렬로) 다시 실행하지 않음
+    cp -Rp "$WORK_DIR/xrdp-patched" "$build"
 
     (
         cd "$build"
