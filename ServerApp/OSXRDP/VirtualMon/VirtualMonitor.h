@@ -43,7 +43,7 @@ public:
     
     // 비활성화 하였던 나머지 모니터들을 다시 활성화
     void RestoreOtherMonitors(int verifyTimeoutMs = 1000);
-    void RestoreOtherMonitorsAfterDisplayWake();
+    bool WaitPendingDisplaysOnline(int timeoutMs);
     
     void StartMonitor();
     

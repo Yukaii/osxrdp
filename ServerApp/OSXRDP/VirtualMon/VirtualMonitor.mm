@@ -7,11 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static const int kDisplayReconfigSettleUsec = 500 * 1000;
 static const int kRestoreAwakeVerifyMs = 5000;
 static const int kHelperProcessTimeoutMs = 5000;
-static const int kDisplaySleepSettleUsec = 1500 * 1000;
-static const int kDisplayWakeSettleUsec = 1500 * 1000;
+static const int kPanelSelfRestoreWaitMs = 4000;
 
 static const int kVirtualDisplayVendorId = 0x1207;
 static const int kVirtualDisplayProductIdBase = 0x5969;
@@ -192,14 +190,6 @@ void VirtualMonitor::Destroy() {
         pthread_join(_watchThread, NULL); // 완전히 정지할때까지 대기
     }
 
-    if (HasPendingRestore()) {
-        WakeupDisplay();
-        usleep(kDisplayReconfigSettleUsec);
-    }
-
-    // 비활성화한 디스플레이 롤백 (반드시 먼저 해야함, 그렇지 않는 경우 위 설명처럼 windowserver 가 크래시할 수 있음)
-    RestoreOtherMonitors();
-
     CGDirectDisplayID virtualIds[16] = {0};
     int virtualCnt = _virtualDisplayInfoCnt;
     for (int i = 0; i < virtualCnt; i++) {
@@ -214,25 +204,53 @@ void VirtualMonitor::Destroy() {
     _init = false;
     ReleaseDisplaySleepAssertion();
 
-    // WindowServer may reject re-enabling the physical panel while a virtual
-    // display is still active. Retry only after the virtual displays are gone.
-    if (HasPendingRestore() && virtualCnt > 0) {
-        for (int i = 0; i < virtualCnt; i++) {
-            DisplayUtils::WaitDisplayOnlineState(virtualIds[i], false, 5000);
-        }
-        WakeupDisplay();
-        usleep(kDisplayReconfigSettleUsec);
-        RestoreOtherMonitors();
+    if (HasPendingRestore() == false) {
+        return;
+    }
 
-        // Disabling the panel also makes its hardware report "out", and
-        // SkyLight refuses to enable it again (kCGErrorFailure, or the request
-        // is silently dropped) until a display wake re-probes the panel and
-        // it reports "in". Sleep the display, wake it, then retry.
-        if (HasPendingRestore()) {
-            NSLog(@"[VirtualMonitor::Destroy] physical display still disabled; cycling display sleep");
-            RestoreOtherMonitorsAfterDisplayWake();
+    // Enable the physical panel only after the virtual displays are gone.
+    // Enabling it while a virtual display is still active can leave the
+    // built-in panel toggling between hotplug "in" and "out", which blocks the
+    // WindowServer main thread in the display driver until the watchdog kills it.
+    for (int i = 0; i < virtualCnt; i++) {
+        DisplayUtils::WaitDisplayOnlineState(virtualIds[i], false, 5000);
+    }
+
+    // After the last virtual display is removed and the display wakes, macOS
+    // normally brings the panel back by itself once it reports "in" again.
+    WakeupDisplay();
+    if (WaitPendingDisplaysOnline(kPanelSelfRestoreWaitMs)) {
+        return;
+    }
+
+    // Otherwise ask once from a fresh process (see EnableDisplaysInHelperProcess).
+    // Do not retry here: a failed restore stays pending for the next teardown.
+    RestoreOtherMonitors(kRestoreAwakeVerifyMs);
+    if (HasPendingRestore()) {
+        NSLog(@"[VirtualMonitor::Destroy] physical display still disabled");
+    }
+}
+
+// Waits for disabled displays to come back without reconfiguring them and
+// drops the restored ones from the pending list. Returns true if none remain.
+bool VirtualMonitor::WaitPendingDisplaysOnline(int timeoutMs) {
+    pthread_mutex_lock(&gDisabledDisplayLock);
+
+    int pendingCnt = 0;
+    for (int i = 0; i < gDisabledDisplayIdsCnt; i++) {
+        if (!DisplayUtils::WaitDisplayOnlineState(gDisabledDisplayIds[i], true, timeoutMs)) {
+            gDisabledDisplayIds[pendingCnt++] = gDisabledDisplayIds[i];
         }
     }
+    gDisabledDisplayIdsCnt = pendingCnt;
+
+    if (pendingCnt == 0) {
+        free(gDisabledDisplayIds);
+        gDisabledDisplayIds = NULL;
+    }
+
+    pthread_mutex_unlock(&gDisabledDisplayLock);
+    return pendingCnt == 0;
 }
 
 void VirtualMonitor::RestoreOtherMonitors(int verifyTimeoutMs) {
@@ -264,27 +282,6 @@ void VirtualMonitor::RestoreOtherMonitors(int verifyTimeoutMs) {
     }
 
     pthread_mutex_unlock(&gDisabledDisplayLock);
-}
-
-void VirtualMonitor::RestoreOtherMonitorsAfterDisplayWake() {
-    // Same request as `pmset displaysleepnow`.
-    char* sleepArgv[] = { (char*)"/usr/bin/pmset", (char*)"displaysleepnow", NULL };
-    if (RunProcess(sleepArgv, kHelperProcessTimeoutMs) != 0) {
-        NSLog(@"[VirtualMonitor::RestoreOtherMonitorsAfterDisplayWake] display sleep request failed");
-    }
-    usleep(kDisplaySleepSettleUsec);
-
-    // Same as `caffeinate -u`; keep it declared until the restore is verified.
-    IOPMAssertionID wakeAssertion = kIOPMNullAssertionID;
-    IOPMAssertionDeclareUserActivity(CFSTR("OSXRDP: restore physical display"), kIOPMUserActiveLocal, &wakeAssertion);
-
-    // Give the panel time to report "in" after the wake before enabling it.
-    usleep(kDisplayWakeSettleUsec);
-    RestoreOtherMonitors(kRestoreAwakeVerifyMs);
-
-    if (wakeAssertion != kIOPMNullAssertionID) {
-        IOPMAssertionRelease(wakeAssertion);
-    }
 }
 
 // Returns the exit status, or -1 if the process could not run to completion.
