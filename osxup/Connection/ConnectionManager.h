@@ -5,6 +5,7 @@
 #include "../Paint/PaintManager.h"
 #include "../Status/StatusManager.h"
 #include "../Channel/ChannelManager.h"
+#include "../Channel/SoundChannel.h"
 #include "../Command/Command.h"
 
 #include <pthread.h>
@@ -54,6 +55,7 @@ private:
     Command _command;
     PaintManager _paintManager;
     ChannelManager _channelManager;
+    SoundChannel _soundChannel;
     
     xipc_t* _sessionIpc;
     xipc_t* _agentIpc;
@@ -61,10 +63,14 @@ private:
     const mod* _mod;
     bool _pendingInputSync;
     int _pendingToggleFlags;
+    bool _audioRequested;
     
     bool _ConnectToSessionManager();
     bool _ConnectToAgent(int sessionId, bool isLockScreen);
     bool _PreparePaint();
+    
+    // rdpsnd 협상이 끝났고 agent 가 녹화 중이면 오디오 캡처 요청
+    void _RequestAudioIfReady();
         
     void _HandleSessionMessage(int sessionId, int isLockScreen);
     

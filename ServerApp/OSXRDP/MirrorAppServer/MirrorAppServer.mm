@@ -193,6 +193,7 @@ int MirrorAppServer::OnClientConnected(xipc_t* t, xipc_t* client) {
         if (_this->_client != NULL) {
             struct MirrorAppClientCtx* oldCtx = (struct MirrorAppClientCtx*)_this->_client->user_data;
             oldCtx->ScreenRecorder->SendDisconnectMsgToClient();
+            oldCtx->Audio->Stop();
             _this->_client = NULL;
         }
         
@@ -200,6 +201,7 @@ int MirrorAppServer::OnClientConnected(xipc_t* t, xipc_t* client) {
         
         ctx->ScreenRecorder = _this->CreateScreenRecorder();
         ctx->Clipboard = new ClipboardManager();
+        ctx->Audio = new AudioCaptureManager();
         
         client->user_data = (void*)ctx;
         
@@ -252,6 +254,7 @@ int MirrorAppServer::OnClientDisconnected(xipc_t* t, xipc_t* client) {
         ctx->ScreenRecorder->Stop();
         delete ctx->ScreenRecorder;
         delete ctx->Clipboard;
+        delete ctx->Audio; // 캡처 정지 및 콜백 종료 대기
         free(ctx);
         
         client->user_data = NULL;
@@ -301,6 +304,10 @@ int MirrorAppServer::OnMessageReceived(xipc_t* t, xipc_t* client, void* data, in
             }
             case OSXRDP_CMDTYPE_CLIPBOARD: {
                 ctx->Clipboard->HandleCommand(client, cmd);
+                break;
+            }
+            case OSXRDP_CMDTYPE_AUDIO: {
+                ctx->Audio->HandleCommand(client, cmd);
                 break;
             }
             default:

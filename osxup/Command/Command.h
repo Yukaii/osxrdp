@@ -22,6 +22,8 @@ public:
     void SendSessionReleaseMsg(xipc_t* sessionIpc, int sessionId);
 
     void SendClipboardMsg(xipc_t* agentIpc, int channelId, int channelFlags, const char* data, int dataLen, int totalLen);
+
+    void SendAudioStartMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample);
     
 private:
     

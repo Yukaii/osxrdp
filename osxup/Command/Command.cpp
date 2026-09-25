@@ -155,6 +155,24 @@ void Command::SendClipboardMsg(xipc_t* agentIpc, int channelId, int channelFlags
     xstream_free(stream);
 }
 
+void Command::SendAudioStartMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample) {
+    struct {
+        int cmdType;
+        int packetType;
+        int sampleRate;
+        int channels;
+        int bitsPerSample;
+    } __attribute__((packed)) msg = {
+        OSXRDP_CMDTYPE_AUDIO,
+        OSXRDP_PACKETTYPE_REQ_AUDIOSTART,
+        sampleRate,
+        channels,
+        bitsPerSample
+    };
+
+    xipc_send_data(agentIpc, (void*)&msg, sizeof(msg));
+}
+
 void Command::_SendMsg(xipc_t* ipc, xstream_t* stream) {
     assert(stream != NULL);
     

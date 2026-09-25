@@ -28,7 +28,8 @@ ConnectionManager::ConnectionManager() :
     _sessionId(0),
     _mod(NULL),
     _pendingInputSync(false),
-    _pendingToggleFlags(0)
+    _pendingToggleFlags(0),
+    _audioRequested(false)
 {}
 
 ConnectionManager::~ConnectionManager() {}
@@ -72,6 +73,7 @@ bool ConnectionManager::Connect(const mod* mod) {
     
     _mod = mod;
     _channelManager.Initialize(mod);
+    _soundChannel.Initialize(mod);
     
     _command.SendSessionRequestMsg(_sessionIpc, mod->username, (int)usernameLen);
     
@@ -96,6 +98,7 @@ void ConnectionManager::Release() {
     
     _paintManager.Release();
     _channelManager.Release();
+    _soundChannel.Release();
     
     _inited = false;
 }
@@ -111,6 +114,9 @@ void ConnectionManager::KeepAlive() {
             // 파괴
             xipc_destroy(_agentIpc);
             _agentIpc = NULL;
+            
+            // 새 agent 에는 오디오 캡처를 다시 요청해야 함
+            _audioRequested = false;
         }
     }
     
@@ -229,6 +235,14 @@ void ConnectionManager::HandleChannelMsg(long param1, long param2, long param3, 
     const char* data = (const char*)param3;
     int totalLen = (int)param4;
     
+    // rdpsnd 는 osxup 에서 직접 처리 (agent 연결 여부와 무관)
+    if (_soundChannel.IsSoundChannel(channelId)) {
+        _soundChannel.HandleChannelData(channelFlags, data, dataLen, totalLen);
+        _RequestAudioIfReady();
+        
+        return;
+    }
+    
     // 유효한 (처리하는) 이벤트인지 확인
     int channel_msg_type = _channelManager.IsValidChannelMsg(channelId, channelFlags, data, dataLen, totalLen);
     if (channel_msg_type == OSXRDP_CHANNEL_INVALID) {
@@ -329,6 +343,9 @@ bool ConnectionManager::_ConnectToAgent(int sessionId, bool isLockScreen) {
     // 클립보드 활성화
     _channelManager.SendClipboardServerInit();
     
+    // 오디오 협상 시작 (연결당 1회)
+    _soundChannel.SendServerFormats();
+    
     _agentIpc = ipc;
 
     return true;
@@ -350,7 +367,27 @@ bool ConnectionManager::_PreparePaint() {
         _pendingInputSync = false;
     }
     
+    _RequestAudioIfReady();
+    
     return true;
+}
+
+void ConnectionManager::_RequestAudioIfReady() {
+    if (_audioRequested || _agentIpc == NULL || _soundChannel.IsReady() == false) {
+        return;
+    }
+    
+    // 가상 모니터 구성 등 화면 녹화 준비가 끝난 뒤 오디오 캡처 시작
+    // (클라이언트가 최소화(suppress)된 상태에서도 오디오는 재생되어야 하므로 CheckCanPaint 는 사용하지 않음)
+    if (_statusManager.CheckCanAcceptInput() == false) {
+        return;
+    }
+    
+    _command.SendAudioStartMsg(_agentIpc,
+                               _soundChannel.GetSampleRate(),
+                               _soundChannel.GetChannels(),
+                               _soundChannel.GetBitsPerSample());
+    _audioRequested = true;
 }
 
 void ConnectionManager::_HandleSessionMessage(int sessionId, int isLockScreen) {
@@ -453,6 +490,18 @@ int ConnectionManager::_OnReceivedAgentManagerMessage(xipc_t* t, xipc_t* client,
                                                                     dataLen,
                                                                     totalLen,
                                                                     channelFlags);
+                }
+            }
+            break;
+        }
+        case OSXRDP_CMDTYPE_AUDIO: {
+            int packetType = xstream_readInt32(stream);
+            if (packetType == OSXRDP_PACKETTYPE_AUDIODATA) {
+                int dataLen = xstream_readInt32(stream);
+                const void* rawData = xstream_readData(stream, dataLen);
+                
+                if (rawData != NULL) {
+                    _this->_soundChannel.SendAudio(rawData, dataLen);
                 }
             }
             break;

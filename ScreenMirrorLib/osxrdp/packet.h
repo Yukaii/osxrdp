@@ -27,6 +27,13 @@
 
 #define OSXRDP_CMDTYPE_NEEDPAINT 4
 
+#define OSXRDP_CMDTYPE_AUDIO 5
+#define OSXRDP_PACKETTYPE_REQ_AUDIOSTART 1  // osxup -> agent (sampleRate, channels, bitsPerSample)
+#define OSXRDP_PACKETTYPE_AUDIODATA      2  // agent -> osxup (dataLen, interleaved PCM)
+
+// ipc 수신 버퍼(MAX_BUFFER, 16KB)를 넘지 않도록 audio 데이터 1회 전송량 제한
+#define OSXRDP_AUDIO_MAX_CHUNK 8192
+
 
 #endif
 
