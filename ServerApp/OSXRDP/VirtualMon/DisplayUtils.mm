@@ -84,32 +84,3 @@ bool DisplayUtils::WaitDisplayOnlineState(CGDirectDisplayID displayId, bool shou
         usleep(kPollIntervalMs * 1000);
     }
 }
-
-bool DisplayUtils::ApplyDisplayEnabled(uint32_t* displayIds, int displayCnt, bool enabled) {
-    if (displayIds == NULL || displayCnt <= 0) {
-        return true;
-    }
-
-    CGDisplayConfigRef cfg = NULL;
-    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess || cfg == NULL) {
-        return false;
-    }
-
-    bool configured = false;
-    for (int i = 0; i < displayCnt; i++) {
-        if (CGSConfigureDisplayEnabled(cfg, displayIds[i], enabled) == kCGErrorSuccess) {
-            configured = true;
-        }
-    }
-
-    if (configured == false) {
-        CGCancelDisplayConfiguration(cfg);
-        return false;
-    }
-
-    if (CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly) != kCGErrorSuccess) {
-        return false;
-    }
-
-    return true;
-}

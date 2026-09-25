@@ -37,13 +37,12 @@ public:
     // 모든 가상 모니터를 파괴
     void Destroy();
     
-    // 가상 모니터를 제외한 나머지 모니터를 비활성화
+    // 가상 모니터를 제외한 나머지 (물리) 모니터가 주 가상 모니터를 미러링하도록 구성
     // 가상 모니터를 파괴 시 원래대로 돌아옴
-    bool DisableOtherMonitors();
+    bool MirrorOtherMonitors();
     
-    // 비활성화 하였던 나머지 모니터들을 다시 활성화
-    void RestoreOtherMonitors(int verifyTimeoutMs = 1000);
-    bool WaitPendingDisplaysOnline(int timeoutMs);
+    // 이 인스턴스의 가상 모니터를 미러링 중인 모니터의 미러링을 해제
+    void UnmirrorOtherMonitors();
     
     void StartMonitor();
     
