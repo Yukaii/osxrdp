@@ -6,6 +6,7 @@
 #include "../Status/StatusManager.h"
 #include "../Channel/ChannelManager.h"
 #include "../Channel/SoundChannel.h"
+#include "../Channel/AudioInputChannel.h"
 #include "../Command/Command.h"
 
 #include <pthread.h>
@@ -50,6 +51,11 @@ public:
     // handle channel msg (clipboard, etc)
     void HandleChannelMsg(long param1, long param2, long param3, long param4);
     
+    // 동적 가상 채널 이벤트 (마이크)
+    void HandleDrdynvcOpenResponse(int channelId, int creationStatus);
+    void HandleDrdynvcCloseResponse(int channelId);
+    void HandleDrdynvcData(int channelId, const char* data, int dataLen);
+    
     // 클라이언트 해상도 변경 (xrdp dynamic resize, mod 의 해상도 정보는 이미 갱신된 상태)
     // inProgress 가 1 이면 녹화 재구성이 끝난 뒤 server_monitor_resize_done 을 호출
     void Resize(int* inProgress);
@@ -61,6 +67,7 @@ private:
     PaintManager _paintManager;
     ChannelManager _channelManager;
     SoundChannel _soundChannel;
+    AudioInputChannel _audioInput;
     
     xipc_t* _sessionIpc;
     xipc_t* _agentIpc;
@@ -93,6 +100,10 @@ private:
     
     // agent 수신 메시지 처리
     static int _OnReceivedAgentManagerMessage(xipc_t* t, xipc_t* client, void* data, int len);
+    
+    // 클라이언트 마이크 데이터를 agent 로 전달
+    static void _OnMicFormat(void* userData, int sampleRate, int channels, int bitsPerSample);
+    static void _OnMicData(void* userData, const void* pcm, int pcmLen);
 };
 
 #endif /* ConnectionManager_h */

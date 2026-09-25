@@ -181,6 +181,53 @@ void Command::SendAudioStartMsg(xipc_t* agentIpc, int sampleRate, int channels, 
     xipc_send_data(agentIpc, (void*)&msg, sizeof(msg));
 }
 
+void Command::SendMicFormatMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample) {
+    struct {
+        int cmdType;
+        int packetType;
+        int sampleRate;
+        int channels;
+        int bitsPerSample;
+    } __attribute__((packed)) msg = {
+        OSXRDP_CMDTYPE_MIC,
+        OSXRDP_PACKETTYPE_MIC_FORMAT,
+        sampleRate,
+        channels,
+        bitsPerSample
+    };
+
+    xipc_send_data(agentIpc, (void*)&msg, sizeof(msg));
+}
+
+void Command::SendMicDataMsg(xipc_t* agentIpc, const void* pcm, int pcmLen) {
+    struct {
+        int cmdType;
+        int packetType;
+        int dataLen;
+        char data[OSXRDP_AUDIO_MAX_CHUNK];
+    } __attribute__((packed)) msg;
+
+    // ipc 수신 버퍼 크기에 맞춰 분할 (sample 경계 유지를 위해 4byte 단위)
+    const char* src = (const char*)pcm;
+    int offset = 0;
+
+    while (offset < pcmLen) {
+        int chunkLen = pcmLen - offset;
+        if (chunkLen > OSXRDP_AUDIO_MAX_CHUNK) {
+            chunkLen = OSXRDP_AUDIO_MAX_CHUNK;
+        }
+
+        msg.cmdType = OSXRDP_CMDTYPE_MIC;
+        msg.packetType = OSXRDP_PACKETTYPE_MIC_DATA;
+        msg.dataLen = chunkLen;
+        memcpy(msg.data, src + offset, chunkLen);
+
+        xipc_send_data(agentIpc, (void*)&msg, (int)(sizeof(int) * 3) + chunkLen);
+
+        offset += chunkLen;
+    }
+}
+
 void Command::_SendMsg(xipc_t* ipc, xstream_t* stream) {
     assert(stream != NULL);
     

@@ -342,6 +342,29 @@ lib_send_server_monitor_full_invalidate(struct mod *mod, int width, int height)
 }
 
 /******************************************************************************/
+/* dynamic virtual channels (osxrdp xrdp patch) */
+static int
+lib_mod_drdynvc_open_response(struct mod *mod, int chan_id, int creation_status)
+{
+    mod->connectionManager->HandleDrdynvcOpenResponse(chan_id, creation_status);
+    return 0;
+}
+
+static int
+lib_mod_drdynvc_close_response(struct mod *mod, int chan_id)
+{
+    mod->connectionManager->HandleDrdynvcCloseResponse(chan_id);
+    return 0;
+}
+
+static int
+lib_mod_drdynvc_data(struct mod *mod, int chan_id, char *data, int data_bytes)
+{
+    mod->connectionManager->HandleDrdynvcData(chan_id, data, data_bytes);
+    return 0;
+}
+
+/******************************************************************************/
 
 extern "C" {
 
@@ -368,6 +391,9 @@ mod_init(void)
     mod->mod_server_monitor_resize = lib_send_server_monitor_resize;
     mod->mod_server_monitor_full_invalidate = lib_send_server_monitor_full_invalidate;
     mod->mod_server_version_message = lib_send_server_version_message;
+    mod->mod_drdynvc_open_response = lib_mod_drdynvc_open_response;
+    mod->mod_drdynvc_close_response = lib_mod_drdynvc_close_response;
+    mod->mod_drdynvc_data = lib_mod_drdynvc_data;
     
     
     mod->connectionManager = new ConnectionManager();

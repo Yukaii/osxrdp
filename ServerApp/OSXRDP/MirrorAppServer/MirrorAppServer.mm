@@ -194,6 +194,7 @@ int MirrorAppServer::OnClientConnected(xipc_t* t, xipc_t* client) {
             struct MirrorAppClientCtx* oldCtx = (struct MirrorAppClientCtx*)_this->_client->user_data;
             oldCtx->ScreenRecorder->SendDisconnectMsgToClient();
             oldCtx->Audio->Stop();
+            oldCtx->Microphone->Stop();
             _this->_client = NULL;
         }
         
@@ -202,6 +203,8 @@ int MirrorAppServer::OnClientConnected(xipc_t* t, xipc_t* client) {
         ctx->ScreenRecorder = _this->CreateScreenRecorder();
         ctx->Clipboard = new ClipboardManager();
         ctx->Audio = new AudioCaptureManager();
+        ctx->Microphone = new MicrophoneManager();
+        ctx->Microphone->Start(client);
         
         client->user_data = (void*)ctx;
         
@@ -255,6 +258,7 @@ int MirrorAppServer::OnClientDisconnected(xipc_t* t, xipc_t* client) {
         delete ctx->ScreenRecorder;
         delete ctx->Clipboard;
         delete ctx->Audio; // 캡처 정지 및 콜백 종료 대기
+        delete ctx->Microphone; // 재생 정지 및 기본 입력 장치 복원
         free(ctx);
         
         client->user_data = NULL;
@@ -308,6 +312,10 @@ int MirrorAppServer::OnMessageReceived(xipc_t* t, xipc_t* client, void* data, in
             }
             case OSXRDP_CMDTYPE_AUDIO: {
                 ctx->Audio->HandleCommand(client, cmd);
+                break;
+            }
+            case OSXRDP_CMDTYPE_MIC: {
+                ctx->Microphone->HandleCommand(client, cmd);
                 break;
             }
             default:

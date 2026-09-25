@@ -35,6 +35,13 @@
 // ipc 수신 버퍼(MAX_BUFFER, 16KB)를 넘지 않도록 audio 데이터 1회 전송량 제한
 #define OSXRDP_AUDIO_MAX_CHUNK 8192
 
+// 마이크 (클라이언트 -> mac). mac 에서 가상 마이크로 녹음하는 앱이 있을 때만 클라이언트 마이크를 사용
+#define OSXRDP_CMDTYPE_MIC 6
+#define OSXRDP_PACKETTYPE_MIC_REQ_START 1   // agent -> osxup (가상 마이크 녹음 시작)
+#define OSXRDP_PACKETTYPE_MIC_REQ_STOP  2   // agent -> osxup (가상 마이크 녹음 종료)
+#define OSXRDP_PACKETTYPE_MIC_FORMAT    3   // osxup -> agent (sampleRate, channels, bitsPerSample)
+#define OSXRDP_PACKETTYPE_MIC_DATA      4   // osxup -> agent (dataLen, interleaved PCM)
+
 
 #endif
 

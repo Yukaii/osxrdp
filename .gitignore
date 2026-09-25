@@ -26,3 +26,5 @@ xcuserdata/
 
 ## xrdp build (scripts/build_xrdp.sh)
 /build/xrdp/
+/build/audiodriver/
+package/source/driver/

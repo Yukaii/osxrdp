@@ -40,7 +40,13 @@ struct mod
     int (*mod_server_monitor_full_invalidate)(struct mod *v,
             int width, int height);
     int (*mod_server_version_message)(struct mod *v);
-    void* mod_dumby[100 - 14]; /* align, 100 minus the number of mod
+    /* dynamic virtual channels (osxrdp xrdp patch) */
+    int (*mod_drdynvc_open_response)(struct mod *v, int chan_id,
+                                     int creation_status);
+    int (*mod_drdynvc_close_response)(struct mod *v, int chan_id);
+    int (*mod_drdynvc_data)(struct mod *v, int chan_id,
+                            char *data, int data_bytes);
+    void* mod_dumby[100 - 17]; /* align, 100 minus the number of mod
                                  functions above */
     
     
@@ -156,7 +162,17 @@ struct mod
     int (*server_egfx_cmd)(struct mod *v,
                            char *cmd, int cmd_bytes,
                            char *data, int data_bytes);
-    void* server_dumby[100 - 50];
+    int (*server_set_pointer_system)(struct mod *v, int pointer_type);
+    int (*server_set_pointer_position)(struct mod *v, int x, int y);
+    /* dynamic virtual channels (osxrdp xrdp patch, NULL on older xrdp)
+       server_drdynvc_open returns 2 if the client has not set up dynamic
+       virtual channels yet */
+    int (*server_drdynvc_open)(struct mod *v, const char *name,
+                               int flags, int *chan_id);
+    int (*server_drdynvc_close)(struct mod *v, int chan_id);
+    int (*server_drdynvc_send)(struct mod *v, int chan_id,
+                               const char *data, int data_bytes);
+    void* server_dumby[100 - 55];
     
     void* handle;
     void* wm;

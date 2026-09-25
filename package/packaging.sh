@@ -53,6 +53,7 @@ mkdir -p "$PAYLOAD_DIR/etc/xrdp"
 mkdir -p "$PAYLOAD_DIR/etc/osxrdp"
 mkdir -p "$PAYLOAD_DIR/usr/local/lib/xrdp"
 mkdir -p "$PAYLOAD_DIR/usr/local/share/xrdp"
+mkdir -p "$PAYLOAD_DIR/Library/Audio/Plug-Ins/HAL"
 
 # 앱 복사 (이미 서명된 앱이라고 가정)
 if [ -d "$SOURCE_DIR/$APP_NAME" ]; then
@@ -82,6 +83,14 @@ if [ -d "$SOURCE_DIR/log" ]; then
 fi
 
 cp "$SOURCE_DIR/module/libosxup.dylib" "$PAYLOAD_DIR/usr/local/lib/xrdp"
+
+# 가상 마이크 (Core Audio HAL plug-in, build_once.sh 에서 서명된 상태)
+if [ -d "$SOURCE_DIR/driver/OSXRDPAudio.driver" ]; then
+    cp -R "$SOURCE_DIR/driver/OSXRDPAudio.driver" "$PAYLOAD_DIR/Library/Audio/Plug-Ins/HAL/"
+else
+    echo "❌ Error: 'OSXRDPAudio.driver' not found in source/driver directory."
+    exit 1
+fi
 cp "$SOURCE_DIR/resources/"* "$PAYLOAD_DIR/usr/local/share/xrdp"
 
 # 권한 설정

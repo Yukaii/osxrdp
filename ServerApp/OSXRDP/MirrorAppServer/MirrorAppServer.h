@@ -5,12 +5,14 @@
 #include "../ScreenRecorder/ScreenRecorderManager.h"
 #include "../Clipboard/ClipboardManager.h"
 #include "../Audio/AudioCaptureManager.h"
+#include "../Audio/MicrophoneManager.h"
 #include <pthread.h>
 
 struct MirrorAppClientCtx {
     ScreenRecorderManager* ScreenRecorder; // currently only one.
     ClipboardManager* Clipboard;
     AudioCaptureManager* Audio;
+    MicrophoneManager* Microphone;
 };
 
 class MirrorAppServer {

@@ -86,6 +86,7 @@ bool ConnectionManager::Connect(const mod* mod) {
     _mod = mod;
     _channelManager.Initialize(mod);
     _soundChannel.Initialize(mod);
+    _audioInput.Initialize(mod, _OnMicFormat, _OnMicData, this);
     
     _command.SendSessionRequestMsg(_sessionIpc, mod->username, (int)usernameLen);
     
@@ -111,6 +112,7 @@ void ConnectionManager::Release() {
     _paintManager.Release();
     _channelManager.Release();
     _soundChannel.Release();
+    _audioInput.Release();
     
     _inited = false;
 }
@@ -120,6 +122,9 @@ void ConnectionManager::KeepAlive() {
         printf("[ConnectionManager] resize timed out\n");
         _CompleteResize();
     }
+    
+    // 클라이언트의 동적 채널이 준비되기 전에 마이크를 요청한 경우 재시도
+    _audioInput.CheckPendingOpen();
     
     // agent ipc 와 연결된 경우
     if (_agentIpc != NULL) {
@@ -134,6 +139,9 @@ void ConnectionManager::KeepAlive() {
             
             // 새 agent 에는 오디오 캡처를 다시 요청해야 함
             _audioRequested = false;
+            
+            // 마이크는 새 agent 가 가상 마이크 사용 여부를 다시 알려줌
+            _audioInput.Stop();
         }
     }
     
@@ -384,6 +392,36 @@ bool ConnectionManager::_PreparePaint() {
     return true;
 }
 
+void ConnectionManager::HandleDrdynvcOpenResponse(int channelId, int creationStatus) {
+    _audioInput.HandleOpenResponse(channelId, creationStatus);
+}
+
+void ConnectionManager::HandleDrdynvcCloseResponse(int channelId) {
+    _audioInput.HandleCloseResponse(channelId);
+}
+
+void ConnectionManager::HandleDrdynvcData(int channelId, const char* data, int dataLen) {
+    _audioInput.HandleData(channelId, data, dataLen);
+}
+
+void ConnectionManager::_OnMicFormat(void* userData, int sampleRate, int channels, int bitsPerSample) {
+    ConnectionManager* _this = (ConnectionManager*)userData;
+    if (_this->_agentIpc == NULL) {
+        return;
+    }
+    
+    _this->_command.SendMicFormatMsg(_this->_agentIpc, sampleRate, channels, bitsPerSample);
+}
+
+void ConnectionManager::_OnMicData(void* userData, const void* pcm, int pcmLen) {
+    ConnectionManager* _this = (ConnectionManager*)userData;
+    if (_this->_agentIpc == NULL) {
+        return;
+    }
+    
+    _this->_command.SendMicDataMsg(_this->_agentIpc, pcm, pcmLen);
+}
+
 void ConnectionManager::Resize(int* inProgress) {
     *inProgress = 0;
     
@@ -589,6 +627,16 @@ int ConnectionManager::_OnReceivedAgentManagerMessage(xipc_t* t, xipc_t* client,
                 if (rawData != NULL) {
                     _this->_soundChannel.SendAudio(rawData, dataLen);
                 }
+            }
+            break;
+        }
+        case OSXRDP_CMDTYPE_MIC: {
+            int packetType = xstream_readInt32(stream);
+            if (packetType == OSXRDP_PACKETTYPE_MIC_REQ_START) {
+                _this->_audioInput.Start();
+            }
+            else if (packetType == OSXRDP_PACKETTYPE_MIC_REQ_STOP) {
+                _this->_audioInput.Stop();
             }
             break;
         }

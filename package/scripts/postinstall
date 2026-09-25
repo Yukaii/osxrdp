@@ -21,6 +21,9 @@ xattr -d com.apple.quarantine /Library/LaunchDaemons/com.byungho.osxrdp.plist 2>
 xattr -d com.apple.quarantine /Library/LaunchDaemons/com.byungho.osxrdp.sessionmanager.plist 2>/dev/null
 xattr -d com.apple.quarantine /Library/LaunchAgents/com.byungho.osxrdp.lockscreen.plist 2>/dev/null
 
+# load the virtual microphone (Core Audio HAL plug-in). launchd restarts coreaudiod
+killall coreaudiod 2>/dev/null
+
 # start service
 launchctl bootstrap system /Library/LaunchDaemons/com.byungho.osxrdp.plist
 launchctl enable system/com.byungho.osxrdp

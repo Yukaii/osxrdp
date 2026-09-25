@@ -25,6 +25,7 @@ private:
     bool UnregisterDaemon(const char* path);
     bool ForgetReceipt(const char* pkgid);
     bool CleanInstallHistory(const char* pkgidPrefix);
+    bool RestartCoreAudio();
 };
 
 #endif /* UninstallManager_h */

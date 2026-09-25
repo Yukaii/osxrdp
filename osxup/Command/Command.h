@@ -26,6 +26,9 @@ public:
 
     void SendAudioStartMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample);
     
+    void SendMicFormatMsg(xipc_t* agentIpc, int sampleRate, int channels, int bitsPerSample);
+    void SendMicDataMsg(xipc_t* agentIpc, const void* pcm, int pcmLen);
+    
 private:
     
     void _SendRecordMsg(xipc_t* agentIpc, int packetType, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo);

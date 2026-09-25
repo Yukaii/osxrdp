@@ -31,6 +31,11 @@ mv /tmp/libosxup.dylib ./package/source/module/libosxup.dylib
 rm -rf /tmp/build_arm64
 rm -rf /tmp/build_x86_64
 
+# build virtual microphone (Core Audio HAL plug-in)
+rm -rf ./package/source/driver/OSXRDPAudio.driver
+SIGN_IDENTITY="Developer ID Application: BYEONGHO KIM (33X7M69J4B)" \
+  ./scripts/build_audio_driver.sh ./package/source/driver
+
 # build osxrdp main app
 xcodebuild build -scheme "OSXRDP" -configuration Release \
   -destination "generic/platform=macOS" \

@@ -69,6 +69,10 @@ void UninstallManager::DoUninstall() {
     RemoveFile("/var/log/xrdp.log");
     RemoveDirectory("/Applications/osxrdp");
 
+    // 가상 마이크 (Core Audio HAL plug-in). coreaudiod 를 재시작해야 장치가 사라진다
+    RemoveDirectory("/Library/Audio/Plug-Ins/HAL/OSXRDPAudio.driver");
+    RestartCoreAudio();
+
     // 설치 흔적(receipt) 및 시스템 리포트 > 설치 목록 정리
     ForgetReceipt("com.byungho.osxrdp.setup");
     CleanInstallHistory("com.byungho.osxrdp");
@@ -103,6 +107,15 @@ bool UninstallManager::UnregisterDaemon(const char* path) {
     char* args[] = { "bootout" , (char*)path, NULL};
 
     AuthorizationExecuteWithPrivileges(_authRef, "/bin/launchctl", kAuthorizationFlagDefaults, args, NULL);
+
+    return true;
+}
+
+bool UninstallManager::RestartCoreAudio() {
+    // launchd 가 바로 다시 실행한다 (launchctl kickstart 는 SIP 로 막힐 수 있음)
+    char* args[] = { "coreaudiod", NULL };
+
+    AuthorizationExecuteWithPrivileges(_authRef, "/usr/bin/killall", kAuthorizationFlagDefaults, args, NULL);
 
     return true;
 }
