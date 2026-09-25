@@ -48,6 +48,21 @@ osxrdp 2.0.0 이후 버전부터 클라이언트 <---> 서버간 파일/폴더 �
   4. 파일을 저장할 폴더 경로를 선택합니다.<img width="1366" height="800" alt="2" src="https://github.com/user-attachments/assets/c4c9c62a-7d47-4e45-86db-ef37a9d4d6d1" />
   5. 다음과 같이 파일/폴더가 복사되는것을 확인할 수 있습니다.<img width="1366" height="800" alt="3" src="https://github.com/user-attachments/assets/988a260f-7656-4c58-aa1d-b0c0e869e1ac" />
 
+## 오디오 및 마이크
+
+- **오디오**: Mac 에서 재생되는 소리가 클라이언트에서 재생됩니다. RDP 클라이언트에서 "이 장치에서 재생" (또는 동일한 옵션) 을 활성화하세요.
+  오디오는 macOS 13 이상에서 지원됩니다. 클라이언트가 지원하면 대역폭 절약을 위해 AAC 로 전송합니다.
+  압축하지 않은 오디오를 사용하려면 `/etc/xrdp/xrdp.ini` 의 세션 항목 (`[osxrdp]`, `[osxrdp_novirtmon]`) 에 `audio_codec=pcm` 을 추가하세요.
+- **마이크**: RDP 클라이언트에서 마이크 리디렉션을 활성화하세요. osxrdp 는 **OSXRDP Microphone** 이라는 가상 입력 장치를 설치하며,
+  원격 연결 중에는 이 장치가 기본 입력 장치로 설정됩니다 (연결 종료 후 원래 장치로 복원).
+  Mac 의 앱이 이 장치로 녹음하는 동안에만 클라이언트의 마이크를 사용합니다.
+
+## 연결 품질 및 해상도
+
+- 연결 중에 왕복 시간 (RTT) 과 대역폭을 측정하여 클라이언트에 알려주며 (클라이언트의 연결 정보 / 네트워크 품질),
+  클라이언트가 연결 끊김을 감지할 수 있도록 heartbeat 를 전송합니다. `/etc/xrdp/xrdp.ini` 의 `[Globals]` 에서 `network_autodetect=false` / `heartbeat=false` 로 끌 수 있습니다.
+- 클라이언트 창 크기를 바꾸거나 기기를 회전하면 원격 해상도가 따라서 변경됩니다.
+
 ## 기타
 * 안정적이고 좋은 연결 품질을 유지하기위해 원격 대상 Mac을 유선 네트워크로 연결하십시오.\
   WI-FI 사용시 AWDL 간섭으로 인해 지연이 발생할 수 있습니다.\

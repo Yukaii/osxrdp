@@ -52,6 +52,21 @@ Starting from **osxrdp 2.0.0**, osxrdp supports file and folder copy between the
   4. Select the folder path where the files will be saved.<img width="1366" height="800" alt="2" src="https://github.com/user-attachments/assets/c4c9c62a-7d47-4e45-86db-ef37a9d4d6d1" />
   5. You can confirm that the files or folders have been copied as follows.<img width="1366" height="800" alt="3" src="https://github.com/user-attachments/assets/988a260f-7656-4c58-aa1d-b0c0e869e1ac" />
 
+## Audio and Microphone
+
+- **Audio**: Sound playing on the Mac is played on the client. Enable "Play on this device" (or the equivalent option) in the RDP client.
+  Audio requires macOS 13 or later. When the client supports it, audio is sent as AAC to save bandwidth.
+  To send uncompressed audio instead, add `audio_codec=pcm` to the session section (`[osxrdp]`, `[osxrdp_novirtmon]`) in `/etc/xrdp/xrdp.ini`.
+- **Microphone**: Enable microphone redirection in the RDP client. osxrdp installs a virtual input device named **OSXRDP Microphone**,
+  which becomes the default input device during a remote session (the previous default is restored afterwards).
+  The client's microphone is only used while an app on the Mac is recording from this device.
+
+## Connection Quality and Resolution
+
+- While connected, osxrdp measures the round-trip time and bandwidth and reports them to the client (connection information / network quality in the client),
+  and sends heartbeats so the client can detect a lost connection. These can be disabled with `network_autodetect=false` / `heartbeat=false` in the `[Globals]` section of `/etc/xrdp/xrdp.ini`.
+- When the client window is resized or the device is rotated, the remote resolution follows it.
+
 ## Other
 * For the best stability, it is recommended that the remote Mac be connected to a wired network.\
   Delays may occur due to AWDL when using WI-FI.\
