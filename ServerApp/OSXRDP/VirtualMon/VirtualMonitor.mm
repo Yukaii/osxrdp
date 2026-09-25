@@ -1,20 +1,9 @@
 #include "VirtualMonitor.h"
 #include "DisplayUtils.h"
+#include "LocalCurtain.h"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <unistd.h>
-
-static const int kVirtualDisplayVendorId = 0x1207;
-static const int kVirtualDisplayProductIdBase = 0x5969;
-
-// Virtual displays created by any VirtualMonitor instance (see Create).
-// During a client handoff two instances coexist, and one must not mirror
-// the other's virtual display.
-static bool IsOsxrdpVirtualDisplay(CGDirectDisplayID displayId) {
-    uint32_t productId = CGDisplayModelNumber(displayId);
-    return CGDisplayVendorNumber(displayId) == kVirtualDisplayVendorId &&
-           productId >= kVirtualDisplayProductIdBase && productId < kVirtualDisplayProductIdBase + 16;
-}
 
 // 가상 모니터 해상도 목록
 //  이와 같이 구성을 채우지 않으면 macOS 가 이를 모니터가 아닌 다른 무언가로 인식하여 대화상자를 띄우는것 같음 (airplay 수신기?)
@@ -28,7 +17,8 @@ VirtualMonitor::VirtualMonitor() :
     _virtualDisplayInfoCnt(0),
     _init(false),
     _watchRunning(false),
-    _displaySleepAssertion(kIOPMNullAssertionID)
+    _displaySleepAssertion(kIOPMNullAssertionID),
+    _curtainHeld(false)
 {
     pthread_mutex_init(&_watchLock, 0);
     pthread_cond_init(&_watchWake, 0);
@@ -156,6 +146,7 @@ bool VirtualMonitor::Resize(int index, int width, int height, int left, int top,
 
     ApplyDisplayLayout();
     MirrorOtherMonitors();
+    LocalCurtain::Refresh();
 
     pthread_mutex_unlock(&_watchLock);
 
@@ -163,7 +154,7 @@ bool VirtualMonitor::Resize(int index, int width, int height, int left, int top,
     return true;
 }
 
-void VirtualMonitor::Destroy() {
+void VirtualMonitor::Destroy(bool keepCurtain) {
     // 가상 모미터 watch 스레드 정지
     if (_watchRunning == true) {
         _watchRunning = false;
@@ -184,11 +175,23 @@ void VirtualMonitor::Destroy() {
 
     _init = false;
     ReleaseDisplaySleepAssertion();
+
+    // 가상 모니터를 다시 만드는 경우 (해상도 변경) 에는 로컬 화면/입력 차단을 유지
+    if (_curtainHeld && keepCurtain == false) {
+        LocalCurtain::Release();
+        _curtainHeld = false;
+    }
 }
 
 void VirtualMonitor::StartMonitor() {
     HoldDisplaySleepAssertion();
     WakeupDisplay();
+
+    // 원격 세션 동안 로컬 화면을 가리고 로컬 입력을 차단
+    if (_curtainHeld == false) {
+        LocalCurtain::Acquire();
+        _curtainHeld = true;
+    }
 
     if (_watchRunning == false) {
         _watchRunning = true;
@@ -273,7 +276,7 @@ bool VirtualMonitor::MirrorOtherMonitors() {
 
     for (uint32_t i = 0; i < displayCnt; i++) {
         CGDirectDisplayID displayId = displayIds[i];
-        if (IsVirtualDisplay(displayId) || IsOsxrdpVirtualDisplay(displayId) || CGDisplayMirrorsDisplay(displayId) == masterId) {
+        if (IsVirtualDisplay(displayId) || DisplayUtils::IsOsxrdpVirtualDisplay(displayId) || CGDisplayMirrorsDisplay(displayId) == masterId) {
             continue;
         }
 
@@ -761,6 +764,7 @@ void VirtualMonitor::WatchThreadPorcInternal() {
     
     // 가상 모니터를 제외한 다른 모니터는 가상 모니터를 미러링 (새로 연결된 모니터 포함)
     MirrorOtherMonitors();
+    LocalCurtain::Refresh();
     
     // 해상도 정보 확인 (가상 모니터)
     for (int i = 0; i < _virtualDisplayInfoCnt; i++) {

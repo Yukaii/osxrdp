@@ -324,7 +324,7 @@ bool ScreenRecorderManager::ResolveDisplayForRecorder(bool reuseVirtualMonitor) 
         
         if (resized == false) {
             NSLog(@"[ScreenRecorderManager::ResolveDisplayForRecorder] could not resize virtual monitor. recreate it");
-            _virtualMonitor.Destroy();
+            _virtualMonitor.Destroy(true);
         }
     }
 

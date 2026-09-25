@@ -35,7 +35,8 @@ public:
     }
     
     // 모든 가상 모니터를 파괴
-    void Destroy();
+    // keepCurtain: 곧 다시 생성하는 경우 로컬 화면/입력 차단 (LocalCurtain) 을 유지
+    void Destroy(bool keepCurtain = false);
     
     // 가상 모니터를 제외한 나머지 (물리) 모니터가 주 가상 모니터를 미러링하도록 구성
     // 가상 모니터를 파괴 시 원래대로 돌아옴
@@ -78,6 +79,7 @@ private:
     pthread_cond_t _watchWake;
     bool _watchRunning;
     IOPMAssertionID _displaySleepAssertion;
+    bool _curtainHeld;
 
     bool IsVirtualDisplay(CGDirectDisplayID displayId);
     bool IsAllVirtualDisplayOnline();

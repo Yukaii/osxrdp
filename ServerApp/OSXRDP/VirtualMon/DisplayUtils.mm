@@ -8,10 +8,20 @@
 
 static const int kPollIntervalMs = 50;
 
+// VirtualMonitor::Create 에서 사용하는 vendor/product id
+static const uint32_t kVirtualDisplayVendorId = 0x1207;
+static const uint32_t kVirtualDisplayProductIdBase = 0x5969;
+
 static uint64_t GetNowMs() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
+}
+
+bool DisplayUtils::IsOsxrdpVirtualDisplay(CGDirectDisplayID displayId) {
+    uint32_t productId = CGDisplayModelNumber(displayId);
+    return CGDisplayVendorNumber(displayId) == kVirtualDisplayVendorId &&
+           productId >= kVirtualDisplayProductIdBase && productId < kVirtualDisplayProductIdBase + 16;
 }
 
 bool DisplayUtils::IsDisplayOnline(CGDirectDisplayID displayId) {
