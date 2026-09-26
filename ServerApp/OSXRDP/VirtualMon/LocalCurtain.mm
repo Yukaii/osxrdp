@@ -41,17 +41,6 @@ static void ApplyBlackoutLocked() {
     }
 }
 
-static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void* userInfo) {
-    (void)display;
-    (void)userInfo;
-
-    if ((flags & kCGDisplayBeginConfigurationFlag) != 0) {
-        return;
-    }
-
-    LocalCurtain::Refresh();
-}
-
 // agent 가 주입한 이벤트만 통과시키고 나머지 (로컬 키보드/마우스/트랙패드) 는 차단
 // 원격 입력 대부분은 kCGSessionEventTap 으로 주입되어 이 HID tap 을 거치지 않으며,
 // kCGHIDEventTap 으로 주입되는 입력 (CJKHelper) 은 source pid 로 구분
@@ -78,6 +67,14 @@ static CGEventRef InputTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 // macOS 가 gamma 를 다시 설정하는 경우 (Night Shift, True Tone, 디스플레이 깨어남 등) 가 있으므로 주기적으로 확인
 static const CFTimeInterval kBlackoutCheckInterval = 0.25;
 
+// 디스플레이 구성이 바뀐 직후 (미러링 변경 등) 에는 gamma 가 초기화되므로 짧은 간격 (약 1 frame) 으로 확인
+// 구성 변경 이후 ColorSync 가 디스플레이 프로파일을 여러번 (약 6초 뒤까지) 다시 적용하면서 gamma 를 초기화하므로 충분히 길게 유지
+static const CFTimeInterval kBlackoutFastCheckInterval = 1.0 / 60.0;
+static const CFTimeInterval kBlackoutFastCheckDuration = 10.0;
+
+static CFRunLoopTimerRef gBlackoutTimer = NULL;
+static CFAbsoluteTime gBlackoutFastCheckUntil = 0;
+
 static bool IsBlackedOut(CGDirectDisplayID displayId) {
     CGGammaValue red[256];
     CGGammaValue green[256];
@@ -98,7 +95,6 @@ static bool IsBlackedOut(CGDirectDisplayID displayId) {
 }
 
 static void BlackoutCheckTimerCallback(CFRunLoopTimerRef timer, void* info) {
-    (void)timer;
     (void)info;
 
     pthread_mutex_lock(&gCurtainLock);
@@ -118,6 +114,39 @@ static void BlackoutCheckTimerCallback(CFRunLoopTimerRef timer, void* info) {
         }
     }
 
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now < gBlackoutFastCheckUntil) {
+        CFRunLoopTimerSetNextFireDate(timer, now + kBlackoutFastCheckInterval);
+    }
+
+    pthread_mutex_unlock(&gCurtainLock);
+}
+
+// 짧은 간격 확인을 시작 (gCurtainLock 을 잡은 상태에서 호출)
+static void StartFastBlackoutCheckLocked() {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    gBlackoutFastCheckUntil = now + kBlackoutFastCheckDuration;
+
+    if (gBlackoutTimer != NULL && gInputTapRunLoop != NULL) {
+        CFRunLoopTimerSetNextFireDate(gBlackoutTimer, now + kBlackoutFastCheckInterval);
+        CFRunLoopWakeUp(gInputTapRunLoop);
+    }
+}
+
+// 디스플레이 구성이 바뀌면 (미러링 변경, 모니터 연결 등) gamma 가 초기화되므로 다시 가리고 한동안 짧은 간격으로 확인
+static void DisplayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void* userInfo) {
+    (void)display;
+    (void)userInfo;
+
+    if ((flags & kCGDisplayBeginConfigurationFlag) != 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&gCurtainLock);
+    if (gCurtainRefCount > 0) {
+        ApplyBlackoutLocked();
+        StartFastBlackoutCheckLocked();
+    }
     pthread_mutex_unlock(&gCurtainLock);
 }
 
@@ -148,6 +177,8 @@ static void* CurtainThreadProc(void* args) {
     pthread_mutex_lock(&gCurtainLock);
     gInputTap = tap;
     gInputTapRunLoop = (CFRunLoopRef)CFRetain(runLoop);
+    gBlackoutTimer = timer;
+    StartFastBlackoutCheckLocked();
     pthread_mutex_unlock(&gCurtainLock);
 
     if (tap != NULL) {
@@ -169,6 +200,7 @@ static void* CurtainThreadProc(void* args) {
 
     pthread_mutex_lock(&gCurtainLock);
     gInputTap = NULL;
+    gBlackoutTimer = NULL;
     pthread_mutex_unlock(&gCurtainLock);
 
     if (timer != NULL) {
